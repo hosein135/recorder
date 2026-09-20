@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Grab BGRA frames from a specific HWND (PrintWindow / BitBlt).
 
-The capture session restores a minimized HWND (without activating it) and
-DWM-cloaks it so PrintWindow still has pixels. This grabber only paints
-frames; it does not change the target's min/max/z-order itself.
+Never restores, cloaks, moves, or re-minimizes the target. The user keeps
+seeing the window and can minimize or maximize it while recording.
 """
 
 from __future__ import annotations
@@ -13,12 +12,10 @@ from ctypes import wintypes
 
 import numpy as np
 
-from windows import RECT, grab_source_rect, window_is_maximized, window_is_minimized
+from windows import grab_source_rect, window_is_maximized, window_is_minimized
 
 user32 = ctypes.windll.user32
 gdi32 = ctypes.windll.gdi32
-dwmapi = ctypes.windll.dwmapi
-kernel32 = ctypes.windll.kernel32
 
 SRCCOPY = 0x00CC0020
 DIB_RGB_COLORS = 0
@@ -32,22 +29,6 @@ PRF_ERASEBKGND = 0x00000008
 PRF_CHILDREN = 0x00000010
 PRF_OWNED = 0x00000020
 WM_PRINT_FLAGS = PRF_CLIENT | PRF_NONCLIENT | PRF_CHILDREN | PRF_ERASEBKGND | PRF_OWNED
-
-WS_POPUP = 0x80000000
-WS_EX_TOOLWINDOW = 0x00000080
-WS_EX_NOACTIVATE = 0x08000000
-WS_EX_LAYERED = 0x00080000
-SW_SHOWNOACTIVATE = 4
-HWND_BOTTOM = 1
-SWP_NOACTIVATE = 0x0010
-SWP_SHOWWINDOW = 0x0040
-SWP_NOZORDER = 0x0004
-LWA_ALPHA = 0x00000002
-DWMWA_CLOAK = 13
-DWM_TNP_RECTDESTINATION = 0x00000001
-DWM_TNP_VISIBLE = 0x00000008
-DWM_TNP_OPACITY = 0x00000004
-PM_REMOVE = 0x0001
 
 gdi32.CreateCompatibleDC.restype = wintypes.HDC
 gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
@@ -88,21 +69,6 @@ user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
 user32.PrintWindow.argtypes = [wintypes.HWND, wintypes.HDC, wintypes.UINT]
 user32.PrintWindow.restype = wintypes.BOOL
 user32.SendMessageW.restype = wintypes.LPARAM
-user32.CreateWindowExW.restype = wintypes.HWND
-user32.CreateWindowExW.argtypes = [
-    wintypes.DWORD,
-    wintypes.LPCWSTR,
-    wintypes.LPCWSTR,
-    wintypes.DWORD,
-    ctypes.c_int,
-    ctypes.c_int,
-    ctypes.c_int,
-    ctypes.c_int,
-    wintypes.HWND,
-    wintypes.HMENU,
-    wintypes.HINSTANCE,
-    wintypes.LPVOID,
-]
 
 
 class BITMAPINFOHEADER(ctypes.Structure):
@@ -123,32 +89,6 @@ class BITMAPINFOHEADER(ctypes.Structure):
 
 class BITMAPINFO(ctypes.Structure):
     _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", wintypes.DWORD * 3)]
-
-
-class SIZE(ctypes.Structure):
-    _fields_ = [("cx", wintypes.LONG), ("cy", wintypes.LONG)]
-
-
-class DWM_THUMBNAIL_PROPERTIES(ctypes.Structure):
-    _fields_ = [
-        ("dwFlags", wintypes.DWORD),
-        ("rcDestination", RECT),
-        ("rcSource", RECT),
-        ("opacity", ctypes.c_ubyte),
-        ("fVisible", wintypes.BOOL),
-        ("fSourceClientAreaOnly", wintypes.BOOL),
-    ]
-
-
-class MSG(ctypes.Structure):
-    _fields_ = [
-        ("hwnd", wintypes.HWND),
-        ("message", wintypes.UINT),
-        ("wParam", wintypes.WPARAM),
-        ("lParam", wintypes.LPARAM),
-        ("time", wintypes.DWORD),
-        ("pt", wintypes.POINT),
-    ]
 
 
 gdi32.CreateDIBSection.restype = wintypes.HBITMAP
@@ -293,18 +233,12 @@ class WindowGrabber:
         self.out_w = out_w
         self.out_h = out_h
         self._last = b"\x00" * (out_w * out_h * 4)
-        self._host = 0
-        self._thumb = wintypes.HANDLE()
 
     def grab(self) -> tuple[bytes, str | None]:
         if not user32.IsWindow(self.hwnd):
             raise RuntimeError("Window closed during capture")
         iconic = window_is_minimized(self.hwnd)
         frame = grab_hwnd_bgra(self.hwnd, self.out_w, self.out_h, letterbox=True)
-        if iconic and _nearly_black(frame):
-            thumb = self._grab_dwm_thumb()
-            if thumb and not _nearly_black(thumb):
-                frame = thumb
         if not _nearly_black(frame):
             self._last = frame
         elif not _nearly_black(self._last):
@@ -316,107 +250,7 @@ class WindowGrabber:
         return frame, "open"
 
     def close(self) -> None:
-        self._release_thumb()
-
-    def _pump(self) -> None:
-        msg = MSG()
-        while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_REMOVE):
-            user32.TranslateMessage(ctypes.byref(msg))
-            user32.DispatchMessageW(ctypes.byref(msg))
-
-    def _ensure_host(self) -> int:
-        if self._host and user32.IsWindow(self._host):
-            return int(self._host)
-        inst = kernel32.GetModuleHandleW(None)
-        host = user32.CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_LAYERED,
-            "Static",
-            "recorder-thumb-host",
-            WS_POPUP,
-            0,
-            0,
-            self.out_w,
-            self.out_h,
-            None,
-            None,
-            inst,
-            None,
-        )
-        if not host:
-            return 0
-        cloak = wintypes.BOOL(True)
-        try:
-            dwmapi.DwmSetWindowAttribute(
-                host, DWMWA_CLOAK, ctypes.byref(cloak), ctypes.sizeof(cloak)
-            )
-        except Exception:
-            pass
-        try:
-            user32.SetLayeredWindowAttributes(host, 0, 1, LWA_ALPHA)
-        except Exception:
-            pass
-        user32.SetWindowPos(
-            host,
-            HWND_BOTTOM,
-            0,
-            0,
-            self.out_w,
-            self.out_h,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOZORDER,
-        )
-        user32.ShowWindow(host, SW_SHOWNOACTIVATE)
-        self._host = int(host)
-        return self._host
-
-    def _release_thumb(self) -> None:
-        if self._thumb:
-            try:
-                dwmapi.DwmUnregisterThumbnail(self._thumb)
-            except Exception:
-                pass
-            self._thumb = wintypes.HANDLE()
-        if self._host:
-            try:
-                user32.DestroyWindow(self._host)
-            except Exception:
-                pass
-            self._host = 0
-
-    def _grab_dwm_thumb(self) -> bytes | None:
-        """DWM still has a thumbnail of minimized windows (taskbar / Alt+Tab)."""
-        host = self._ensure_host()
-        if not host or not user32.IsWindow(self.hwnd):
-            return None
-        if not self._thumb:
-            thumb = wintypes.HANDLE()
-            hr = dwmapi.DwmRegisterThumbnail(host, self.hwnd, ctypes.byref(thumb))
-            if hr != 0 or not thumb:
-                return None
-            self._thumb = thumb
-        props = DWM_THUMBNAIL_PROPERTIES()
-        props.dwFlags = DWM_TNP_RECTDESTINATION | DWM_TNP_VISIBLE | DWM_TNP_OPACITY
-        props.rcDestination = RECT(0, 0, self.out_w, self.out_h)
-        props.opacity = 255
-        props.fVisible = True
-        props.fSourceClientAreaOnly = False
-        dwmapi.DwmUpdateThumbnailProperties(self._thumb, ctypes.byref(props))
-        self._pump()
-        hdc_host = user32.GetWindowDC(host) or user32.GetDC(host)
-        if not hdc_host:
-            return None
-        hdc = gdi32.CreateCompatibleDC(hdc_host)
-        try:
-            dib = _Dib(hdc, self.out_w, self.out_h)
-            painted = user32.PrintWindow(host, hdc, PW_RENDERFULLCONTENT)
-            if not painted:
-                gdi32.BitBlt(hdc, 0, 0, self.out_w, self.out_h, hdc_host, 0, 0, SRCCOPY)
-            data = dib.to_bytes()
-            gdi32.SelectObject(hdc, dib._old)
-            gdi32.DeleteObject(dib.hbmp)
-            return data
-        finally:
-            gdi32.DeleteDC(hdc)
-            user32.ReleaseDC(host, hdc_host)
+        return
 
 
 def grab_screen_bgra(x: int, y: int, src_w: int, src_h: int, out_w: int, out_h: int) -> bytes:

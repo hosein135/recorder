@@ -342,7 +342,7 @@ class RecorderApp(tk.Tk):
 
         ttk.Label(
             left,
-            text="Minimized windows keep recording in the background and return minimized when you stop. F9 starts or stops.",
+            text="The selected window stays on screen. You can minimize or maximize it anytime — recording continues. F9 starts or stops.",
             style="Hint.TLabel",
         ).pack(anchor="w", padx=10, pady=(0, 6))
 
