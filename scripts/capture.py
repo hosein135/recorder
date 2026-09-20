@@ -223,6 +223,10 @@ def _vvenc_tail(hw: HardwareProfile, fps: int, video_kbps: int, video_path: Path
         "-threads",
         str(hw.recommended_vvenc_threads()),
         "-an",
+        "-flush_packets",
+        "1",
+        "-f",
+        "matroska",
         str(video_path),
     ]
 
@@ -328,6 +332,8 @@ def build_mux_cmd(
         "1:a:0",
         "-c:v",
         "copy",
+        "-tag:v",
+        "vvc1",
         "-filter:a",
         f"aresample={rate}",
         "-c:a",
@@ -350,6 +356,38 @@ def build_mux_cmd(
     return cmd
 
 
+def remux_video_mp4(hw: HardwareProfile, src: Path, dest: Path) -> subprocess.CompletedProcess[str]:
+    """Copy VVC into a real MP4. Temp encode is Matroska so a stop cannot lose moov."""
+    flags = CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    cmd = [
+        _ffmpeg(hw),
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(src),
+        "-map",
+        "0:v:0",
+        "-c:v",
+        "copy",
+        "-an",
+        "-tag:v",
+        "vvc1",
+        "-movflags",
+        "+faststart",
+        str(dest),
+    ]
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=flags,
+    )
+
+
 class CaptureSession:
     def __init__(
         self,
@@ -362,7 +400,7 @@ class CaptureSession:
         self.on_log = on_log or (lambda _m: None)
         self.proc: subprocess.Popen[bytes] | None = None
         self.audio: AudioRecorder | None = None
-        self.video_tmp = cfg.output.with_suffix(".video.tmp.mp4")
+        self.video_tmp = cfg.output.with_suffix(".video.tmp.mkv")
         self.audio_tmp = cfg.output.with_suffix(".audio.tmp.wav")
         self._stderr: list[str] = []
         self._err_thread: threading.Thread | None = None
@@ -577,7 +615,7 @@ class CaptureSession:
             self.set_paused(False)
         self._grab_stop.set()
         if self._grab_thread:
-            self._grab_thread.join(timeout=5)
+            self._grab_thread.join(timeout=60)
         if self._grabber is not None:
             try:
                 self._grabber.close()
@@ -598,9 +636,11 @@ class CaptureSession:
                     self.proc.stdin.close()
             except (BrokenPipeError, OSError):
                 pass
+            self.on_log("Finishing H.266 encode (this can take a minute)...")
             try:
-                self.proc.wait(timeout=20)
+                self.proc.wait(timeout=180)
             except subprocess.TimeoutExpired:
+                self.on_log("Encoder still running — stopping it. The temp MKV should still mux.")
                 self.proc.kill()
                 self.proc.wait(timeout=5)
 
@@ -621,15 +661,23 @@ class CaptureSession:
             tail = "\n".join(self._stderr[-20:])
             raise RecorderError(f"No video was written.\n{tail}")
 
-        if audio_err:
-            self.on_log(f"Audio warning: {audio_err} — saving video only")
-            self.video_tmp.replace(self.cfg.output)
+        def _save_video_only(reason: str) -> Path:
+            self.on_log(reason)
+            packed = remux_video_mp4(self.hw, self.video_tmp, self.cfg.output)
+            if packed.returncode != 0:
+                raise RecorderError(
+                    f"{reason}\nCould not write MP4:\n{packed.stderr}"
+                )
+            self.video_tmp.unlink(missing_ok=True)
+            self.audio_tmp.unlink(missing_ok=True)
+            self.on_log(f"Wrote {self.cfg.output} (video only)")
             return self.cfg.output
 
+        if audio_err:
+            return _save_video_only(f"Audio warning: {audio_err} — saving video only")
+
         if not self.audio_tmp.is_file() or self.audio_tmp.stat().st_size < 128:
-            self.on_log("Audio file empty — saving video only")
-            self.video_tmp.replace(self.cfg.output)
-            return self.cfg.output
+            return _save_video_only("Audio file empty — saving video only")
 
         mux = build_mux_cmd(
             self.hw,
@@ -657,11 +705,8 @@ class CaptureSession:
         )
         if mux_proc.returncode != 0:
             self.on_log(mux_proc.stderr.strip() or "mux failed")
-            # Keep the VVC video even if Opus mux fails.
-            fallback = self.cfg.output.with_suffix(".video-only.mp4")
-            self.video_tmp.replace(fallback)
-            raise RecorderError(
-                f"Video encoded but audio mux failed. Video-only file: {fallback}\n{mux_proc.stderr}"
+            return _save_video_only(
+                "Audio mux failed — writing video-only MP4 from the temp MKV."
             )
 
         self.video_tmp.unlink(missing_ok=True)
