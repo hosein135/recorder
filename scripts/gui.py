@@ -164,14 +164,16 @@ class RecorderApp(tk.Tk):
         row.pack(fill="x", padx=10, pady=(10, 4))
         ttk.Label(row, text="FPS").pack(side="left")
         self.fps_var = tk.StringVar(value="30")
-        fps = ttk.Combobox(
+        fps = ttk.Spinbox(
             row,
             textvariable=self.fps_var,
-            values=("15", "24", "25", "30", "60"),
+            from_=1,
+            to=240,
+            increment=1,
             width=8,
-            state="normal",
         )
         fps.pack(side="left", padx=(8, 0))
+        ttk.Label(row, text="type any integer 1-240", style="Muted.TLabel").pack(side="left", padx=(8, 0))
 
         ttk.Label(rec, text="Audio", style="Muted.TLabel").pack(anchor="w", padx=10, pady=(8, 0))
         self.audio_var = tk.StringVar(value="both")
@@ -441,12 +443,12 @@ class RecorderApp(tk.Tk):
             messagebox.showwarning("Recorder", "Select a window (or Entire screen).")
             return
         try:
-            fps = int(self.fps_var.get())
+            fps = int(self.fps_var.get().strip())
         except ValueError:
-            messagebox.showwarning("Recorder", "FPS must be a whole number.")
+            messagebox.showwarning("Recorder", "FPS must be a whole number you type, e.g. 30 or 60.")
             return
-        if fps < 1 or fps > 120:
-            messagebox.showwarning("Recorder", "FPS must be between 1 and 120.")
+        if fps < 1 or fps > 240:
+            messagebox.showwarning("Recorder", "FPS must be a whole number between 1 and 240.")
             return
 
         mode = self.audio_var.get()

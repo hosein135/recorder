@@ -121,7 +121,7 @@ def build_video_cmd(
 ) -> list[str]:
     ffmpeg = _ffmpeg(hw)
     win = refresh_geometry(cfg.window)
-    fps = max(1, min(120, int(cfg.fps)))
+    fps = max(1, min(240, int(cfg.fps)))
 
     cmd: list[str] = [
         ffmpeg,
@@ -224,7 +224,7 @@ class CaptureSession:
             if p.exists():
                 p.unlink()
 
-        fps = max(1, min(120, int(self.cfg.fps)))
+        fps = max(1, min(240, int(self.cfg.fps)))
         flags = CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
         if self._hwnd_mode:
