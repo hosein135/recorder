@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.mp4
+*.mkv
+*.wav
+*.tmp
+recordings/*
+!recordings/.gitkeep
