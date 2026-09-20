@@ -24,10 +24,21 @@ MIN_USEFUL_AUDIO_KBPS = 24
 AUDIO_KBPS_MIN = 8
 AUDIO_KBPS_MAX = 256
 
-DEFAULT_VIDEO_QUALITY = 45
-MIN_USEFUL_VIDEO_QUALITY = 35
-VIDEO_QUALITY_MIN = 1
-VIDEO_QUALITY_MAX = 100
+DEFAULT_SAMPLE_RATE = 48000
+MIN_USEFUL_SAMPLE_RATE = 16000
+SAMPLE_RATE_MIN = 8000
+SAMPLE_RATE_MAX = 48000
+OPUS_SAMPLE_RATES = (8000, 12000, 16000, 24000, 48000)
+
+DEFAULT_VIDEO_KBPS = 1500
+MIN_USEFUL_VIDEO_KBPS = 600
+VIDEO_KBPS_MIN = 100
+VIDEO_KBPS_MAX = 50000
+
+DEFAULT_TOTAL_KBPS = DEFAULT_VIDEO_KBPS + DEFAULT_AUDIO_KBPS
+MIN_USEFUL_TOTAL_KBPS = MIN_USEFUL_VIDEO_KBPS + MIN_USEFUL_AUDIO_KBPS
+TOTAL_KBPS_MIN = VIDEO_KBPS_MIN + AUDIO_KBPS_MIN
+TOTAL_KBPS_MAX = VIDEO_KBPS_MAX + AUDIO_KBPS_MAX
 
 
 @dataclass
@@ -38,23 +49,30 @@ class RecordConfig:
     output: Path
     microphone: AudioDevice | None = None
     loopback: AudioDevice | None = None
-    qp: int = 38
     audio_kbps: int = DEFAULT_AUDIO_KBPS
-    video_quality: int = DEFAULT_VIDEO_QUALITY
+    sample_rate: int = DEFAULT_SAMPLE_RATE
+    video_kbps: int = DEFAULT_VIDEO_KBPS
 
 
 def clamp_audio_kbps(n: int) -> int:
     return max(AUDIO_KBPS_MIN, min(AUDIO_KBPS_MAX, int(n)))
 
 
-def clamp_video_quality(n: int) -> int:
-    return max(VIDEO_QUALITY_MIN, min(VIDEO_QUALITY_MAX, int(n)))
+def clamp_sample_rate(n: int) -> int:
+    return max(SAMPLE_RATE_MIN, min(SAMPLE_RATE_MAX, int(n)))
 
 
-def quality_to_qp(quality: int) -> int:
-    """Map 1 (smallest / roughest) .. 100 (largest / sharpest) to libvvenc QP."""
-    q = clamp_video_quality(quality)
-    return int(round(22 + (100 - q) * 29 / 99))
+def snap_opus_rate(n: int) -> int:
+    n = clamp_sample_rate(n)
+    return min(OPUS_SAMPLE_RATES, key=lambda rate: abs(rate - n))
+
+
+def clamp_video_kbps(n: int) -> int:
+    return max(VIDEO_KBPS_MIN, min(VIDEO_KBPS_MAX, int(n)))
+
+
+def clamp_total_kbps(n: int) -> int:
+    return max(TOTAL_KBPS_MIN, min(TOTAL_KBPS_MAX, int(n)))
 
 
 class RecorderError(RuntimeError):
@@ -83,7 +101,8 @@ def default_output_path(root: Path, window: WindowInfo) -> Path:
     return root / f"{name}_{stamp}.mp4"
 
 
-def _vvenc_tail(hw: HardwareProfile, fps: int, qp: int, video_path: Path) -> list[str]:
+def _vvenc_tail(hw: HardwareProfile, fps: int, video_kbps: int, video_path: Path) -> list[str]:
+    kbps = clamp_video_kbps(video_kbps)
     return [
         "-vf",
         "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p10le",
@@ -93,8 +112,8 @@ def _vvenc_tail(hw: HardwareProfile, fps: int, qp: int, video_path: Path) -> lis
         "libvvenc",
         "-preset",
         hw.recommended_vvenc_preset(fps),
-        "-qp",
-        str(qp),
+        "-b:v",
+        f"{kbps}k",
         "-qpa",
         "1",
         "-period",
@@ -115,7 +134,7 @@ def build_hwnd_cmd(
     width: int,
     height: int,
     fps: int,
-    qp: int,
+    video_kbps: int,
     video_path: Path,
 ) -> list[str]:
     ffmpeg = _ffmpeg(hw)
@@ -136,7 +155,7 @@ def build_hwnd_cmd(
         str(fps),
         "-i",
         "-",
-        *_vvenc_tail(hw, fps, qp, video_path),
+        *_vvenc_tail(hw, fps, video_kbps, video_path),
     ]
 
 
@@ -179,7 +198,7 @@ def build_video_cmd(
             "desktop",
         ]
 
-    cmd += _vvenc_tail(hw, fps, cfg.qp, video_path)
+    cmd += _vvenc_tail(hw, fps, cfg.video_kbps, video_path)
     return cmd
 
 
@@ -189,9 +208,11 @@ def build_mux_cmd(
     audio_path: Path,
     output: Path,
     audio_kbps: int = DEFAULT_AUDIO_KBPS,
+    sample_rate: int = DEFAULT_SAMPLE_RATE,
 ) -> list[str]:
     ffmpeg = _ffmpeg(hw)
     kbps = clamp_audio_kbps(audio_kbps)
+    rate = snap_opus_rate(sample_rate)
     return [
         ffmpeg,
         "-y",
@@ -213,7 +234,7 @@ def build_mux_cmd(
         "-vbr",
         "on",
         "-ar",
-        "48000",
+        str(rate),
         "-shortest",
         "-movflags",
         "+faststart",
@@ -285,7 +306,12 @@ class CaptureSession:
             self._frame_w, self._frame_h = geo.even_size
 
         cmd = build_hwnd_cmd(
-            self.hw, self._frame_w, self._frame_h, fps, self.cfg.qp, self.video_tmp
+            self.hw,
+            self._frame_w,
+            self._frame_h,
+            fps,
+            self.cfg.video_kbps,
+            self.video_tmp,
         )
         self.on_log("FFmpeg: " + " ".join(cmd))
 
@@ -296,8 +322,11 @@ class CaptureSession:
             loopback=self.cfg.loopback,
         )
         self.audio.start()
+        total = clamp_video_kbps(self.cfg.video_kbps) + clamp_audio_kbps(self.cfg.audio_kbps)
         self.on_log(
-            f"Audio: {self.cfg.audio_mode} (WASAPI) → Opus {self.cfg.audio_kbps} kb/s"
+            f"Audio: {self.cfg.audio_mode} (WASAPI) -> Opus {self.cfg.audio_kbps} kb/s "
+            f"{snap_opus_rate(self.cfg.sample_rate)} Hz | "
+            f"video {self.cfg.video_kbps} kb/s | total {total} kb/s"
         )
 
         self.proc = subprocess.Popen(
@@ -473,7 +502,12 @@ class CaptureSession:
             return self.cfg.output
 
         mux = build_mux_cmd(
-            self.hw, self.video_tmp, self.audio_tmp, self.cfg.output, self.cfg.audio_kbps
+            self.hw,
+            self.video_tmp,
+            self.audio_tmp,
+            self.cfg.output,
+            self.cfg.audio_kbps,
+            self.cfg.sample_rate,
         )
         self.on_log("Mux: " + " ".join(mux))
         flags = CREATE_NO_WINDOW if sys.platform == "win32" else 0
