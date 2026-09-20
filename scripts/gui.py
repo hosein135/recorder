@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -32,7 +33,7 @@ from audio import AudioDevice, default_loopback, default_microphone, list_loopba
 from capture import CaptureSession, RecordConfig, RecorderError, default_output_path
 from hw_detect import HardwareProfile, detect, format_involvement_report
 from player import find_mpc_hc, format_size, list_recordings, play_with_mpc
-from windows import WindowInfo, list_windows
+from windows import WindowInfo, cursor_pos, escape_pressed, left_button_down, list_windows, window_at_point
 
 BG = "#1b1d23"
 PANEL = "#252830"
@@ -118,6 +119,7 @@ class RecorderApp(tk.Tk):
         btns = ttk.Frame(left)
         btns.pack(fill="x", padx=8, pady=(8, 4))
         ttk.Button(btns, text="Refresh", command=self.refresh_windows).pack(side="left")
+        ttk.Button(btns, text="Alt+Tab pick...", command=self._open_alt_tab_picker).pack(side="left", padx=(8, 0))
         ttk.Label(btns, text="Filter").pack(side="left", padx=(12, 4))
         self.filter_var = tk.StringVar()
         self.filter_var.trace_add("write", lambda *_: self._apply_filter())
@@ -125,7 +127,7 @@ class RecorderApp(tk.Tk):
         filt.pack(side="left", fill="x", expand=True)
         ttk.Label(
             left,
-            text="Includes minimized Chrome/Edge. Type chrome to find it.",
+            text="Front-to-back like Alt+Tab. Use Alt+Tab pick or click a window on screen.",
             style="Muted.TLabel",
         ).pack(anchor="w", padx=8)
 
@@ -143,6 +145,9 @@ class RecorderApp(tk.Tk):
         self.win_list.configure(yscrollcommand=scroll.set)
         self.win_list.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=(0, 8))
         scroll.pack(side="right", fill="y", pady=(0, 8), padx=(0, 8))
+        self.win_list.bind("<<TreeviewSelect>>", self._on_win_select)
+        self.selected_lbl = ttk.Label(left, text="Selected: Entire screen", style="Muted.TLabel")
+        self.selected_lbl.pack(fill="x", padx=8, pady=(0, 8))
         style = ttk.Style(self)
         style.configure(
             "Treeview",
@@ -216,6 +221,8 @@ class RecorderApp(tk.Tk):
         actions.pack(fill="x", pady=12)
         self.record_btn = ttk.Button(actions, text="●  Record", style="Record.TButton", command=self.toggle_record)
         self.record_btn.pack(side="left")
+        self.pause_btn = ttk.Button(actions, text="Pause", command=self.toggle_pause, state="disabled")
+        self.pause_btn.pack(side="left", padx=(8, 0))
         self.time_label = ttk.Label(actions, text="00:00:00", style="Title.TLabel")
         self.time_label.pack(side="left", padx=16)
 
@@ -224,7 +231,7 @@ class RecorderApp(tk.Tk):
         ttk.Button(rec_bar, text="Refresh", command=lambda: self.refresh_recordings(log=True)).pack(side="left")
         ttk.Label(
             rec_bar,
-            text="Click a recording to play it in Media Player Classic (MPC-HC).",
+            text="Double-click a recording to play it in Media Player Classic (MPC-HC).",
             style="Muted.TLabel",
         ).pack(side="left", padx=12)
         self.mpc_status = ttk.Label(rec_bar, text="", style="Muted.TLabel")
@@ -246,7 +253,7 @@ class RecorderApp(tk.Tk):
         self.rec_list.configure(yscrollcommand=rec_scroll.set)
         self.rec_list.pack(side="left", fill="both", expand=True)
         rec_scroll.pack(side="right", fill="y")
-        self.rec_list.bind("<ButtonRelease-1>", self._on_recording_click)
+        self.rec_list.bind("<Double-Button-1>", self._on_recording_click)
         self.rec_list.bind("<Return>", self._on_recording_enter)
 
         self.hw_box = tk.Text(
@@ -353,15 +360,17 @@ class RecorderApp(tk.Tk):
         for w in self.windows:
             if needle and needle not in w.search_blob():
                 continue
-            iid = "desktop" if w.is_desktop else f"hwnd-{w.hwnd}"
+            iid = "screen" if w.is_desktop else f"hwnd-{w.hwnd}"
             title = w.title.replace("\n", " ").strip() or "(untitled)"
+            if w.is_desktop:
+                title = "Entire screen"
             if len(title) > 90:
                 title = title[:87] + "..."
             self.win_list.insert(
                 "",
                 "end",
                 iid=iid,
-                values=(title, w.exe or ("screen" if w.is_desktop else ""), f"{w.width}x{w.height}", w.state_text()),
+                values=(title, w.exe or ("display" if w.is_desktop else ""), f"{w.width}x{w.height}", w.state_text() or ("display" if w.is_desktop else "")),
             )
             self._by_id[iid] = w
             if first_id is None:
@@ -372,12 +381,185 @@ class RecorderApp(tk.Tk):
         if pick:
             self.win_list.selection_set(pick)
             self.win_list.see(pick)
+            self._on_win_select()
 
     def _selected_window(self) -> WindowInfo | None:
         sel = self.win_list.selection()
         if not sel:
             return None
         return self._by_id.get(sel[0])
+
+    def _on_win_select(self, _event: object | None = None) -> None:
+        if getattr(self, "selected_lbl", None) is None:
+            return
+        w = self._selected_window()
+        if w is None:
+            self.selected_lbl.configure(text="Selected: (none)")
+            return
+        self.selected_lbl.configure(text=f"Selected: {w.label()}")
+
+    def _select_window_info(self, info: WindowInfo) -> None:
+        iid = "screen" if info.is_desktop else f"hwnd-{info.hwnd}"
+        if iid not in self._by_id:
+            if info.is_desktop:
+                self.windows = [info] + [w for w in self.windows if not w.is_desktop]
+            else:
+                rest = [w for w in self.windows if not w.is_desktop]
+                screen = next((w for w in self.windows if w.is_desktop), None)
+                self.windows = ([screen] if screen else []) + [info] + [w for w in rest if w.hwnd != info.hwnd]
+            self._apply_filter(prefer_hwnd=info.hwnd)
+        else:
+            self.win_list.selection_set(iid)
+            self.win_list.see(iid)
+            self._on_win_select()
+        self._log(f"Target: {info.label()}")
+
+    def _tk_hwnds(self, *widgets: tk.Misc) -> set[int]:
+        ids: set[int] = set()
+        for w in widgets:
+            if w is None:
+                continue
+            try:
+                ids.add(int(w.winfo_id()))
+            except Exception:
+                pass
+            try:
+                frame = w.wm_frame()
+                if frame:
+                    ids.add(int(str(frame), 16))
+            except Exception:
+                pass
+        return ids
+
+    def _open_alt_tab_picker(self) -> None:
+        self.refresh_windows()
+        dlg = tk.Toplevel(self)
+        dlg.title("Alt+Tab  -  pick a window")
+        dlg.configure(bg=BG)
+        dlg.transient(self)
+        dlg.attributes("-topmost", True)
+        dlg.geometry("640x480")
+        ttk.Label(
+            dlg,
+            text="Same order as Alt+Tab (front to back). Double-click or Enter to choose.",
+            style="Muted.TLabel",
+        ).pack(anchor="w", padx=12, pady=(10, 4))
+        lb = tk.Listbox(
+            dlg,
+            bg=PANEL,
+            fg=FG,
+            selectbackground=ACCENT,
+            selectforeground="#fff",
+            font=("Segoe UI", 12),
+            activestyle="none",
+            relief="flat",
+        )
+        lb.pack(fill="both", expand=True, padx=12, pady=8)
+        items = list(self.windows)
+        for w in items:
+            lb.insert("end", w.label())
+        if items:
+            lb.selection_set(0)
+            lb.see(0)
+        lb.focus_set()
+
+        def confirm(_event: object | None = None) -> None:
+            sel = lb.curselection()
+            if not sel:
+                return
+            info = items[int(sel[0])]
+            dlg.destroy()
+            self._select_window_info(info)
+
+        def click_screen() -> None:
+            dlg.destroy()
+            self._start_click_pick()
+
+        lb.bind("<Return>", confirm)
+        lb.bind("<Double-Button-1>", confirm)
+        lb.bind("<Escape>", lambda _e: dlg.destroy())
+        bar = ttk.Frame(dlg)
+        bar.pack(fill="x", padx=12, pady=(0, 12))
+        ttk.Button(bar, text="Click a window on screen...", command=click_screen).pack(side="left")
+        ttk.Button(bar, text="OK", command=confirm).pack(side="right")
+        ttk.Button(bar, text="Cancel", command=dlg.destroy).pack(side="right", padx=(0, 8))
+        dlg.grab_set()
+        dlg.wait_window()
+
+    def _start_click_pick(self) -> None:
+        self._log("Click the window to record. Esc cancels.")
+        banner = tk.Toplevel(self)
+        banner.overrideredirect(True)
+        banner.attributes("-topmost", True)
+        banner.configure(bg=ACCENT)
+        ttk.Label(
+            banner,
+            text="  Click the window to record   (Esc to cancel)  ",
+            background=ACCENT,
+            foreground="#fff",
+            font=("Segoe UI Semibold", 12),
+        ).pack(padx=8, pady=8)
+        banner.update_idletasks()
+        bw = banner.winfo_width()
+        bh = banner.winfo_height()
+        sw = banner.winfo_screenwidth()
+        banner.geometry(f"+{(sw - bw) // 2}+12")
+        self._pick_banner = banner
+        self.iconify()
+        threading.Thread(target=self._click_pick_worker, daemon=True, name="click-pick").start()
+
+    def _click_pick_worker(self) -> None:
+        time.sleep(0.3)
+        while left_button_down():
+            if escape_pressed():
+                self.after(0, self._cancel_click_pick)
+                return
+            time.sleep(0.02)
+        while True:
+            if escape_pressed():
+                self.after(0, self._cancel_click_pick)
+                return
+            if left_button_down():
+                x, y = cursor_pos()
+                extra = getattr(self, "_pick_banner", None)
+                exclude = self._tk_hwnds(self, extra) if extra else self._tk_hwnds(self)
+                info = window_at_point(x, y, exclude)
+                self.after(0, lambda i=info: self._finish_click_pick(i))
+                return
+            time.sleep(0.02)
+
+    def _cancel_click_pick(self) -> None:
+        banner = getattr(self, "_pick_banner", None)
+        if banner is not None:
+            try:
+                banner.destroy()
+            except tk.TclError:
+                pass
+            self._pick_banner = None
+        self.deiconify()
+        self.lift()
+        self._log("Window pick cancelled")
+
+    def _finish_click_pick(self, info: WindowInfo | None) -> None:
+        banner = getattr(self, "_pick_banner", None)
+        if banner is not None:
+            try:
+                banner.destroy()
+            except tk.TclError:
+                pass
+            self._pick_banner = None
+        self.deiconify()
+        self.lift()
+        if info is None:
+            messagebox.showwarning("Pick window", "No window under the cursor.")
+            return
+        self._select_window_info(info)
+
+    def toggle_pause(self) -> None:
+        if not self.session:
+            return
+        self.session.set_paused(not self.session.paused)
+        self.pause_btn.configure(text="Resume" if self.session.paused else "Pause")
 
     def refresh_audio(self) -> None:
         try:
@@ -481,6 +663,7 @@ class RecorderApp(tk.Tk):
             messagebox.showerror("Record failed", str(exc))
             return
         self.record_btn.configure(text="■  Stop")
+        self.pause_btn.configure(state="normal", text="Pause")
         try:
             self.win_list.configure(selectmode="none")
         except tk.TclError:
@@ -495,7 +678,8 @@ class RecorderApp(tk.Tk):
         sec = int(self.session.elapsed())
         h, rem = divmod(sec, 3600)
         m, s = divmod(rem, 60)
-        self.time_label.configure(text=f"{h:02d}:{m:02d}:{s:02d}")
+        suffix = "  paused" if self.session.paused else ""
+        self.time_label.configure(text=f"{h:02d}:{m:02d}:{s:02d}{suffix}")
         self._tick_job = self.after(250, self._tick)
 
     def _stop_worker(self) -> None:
@@ -517,6 +701,8 @@ class RecorderApp(tk.Tk):
             self._tick_job = None
         self.session = None
         self.record_btn.configure(text="●  Record", state="normal")
+        self.pause_btn.configure(state="disabled", text="Pause")
+        self.time_label.configure(text="00:00:00")
         try:
             self.win_list.configure(selectmode="browse")
         except tk.TclError:
@@ -557,8 +743,7 @@ class RecorderApp(tk.Tk):
 
     def _on_recording_click(self, event: tk.Event) -> None:
         row = self.rec_list.identify_row(event.y)
-        region = self.rec_list.identify_region(event.x, event.y)
-        if not row or region not in ("cell", "tree"):
+        if not row:
             return
         self.rec_list.selection_set(row)
         self._play_recording(row)

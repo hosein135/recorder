@@ -14,7 +14,7 @@ from typing import Callable
 
 from audio import AudioDevice, AudioMode, AudioRecorder
 from hw_detect import HardwareProfile
-from hwnd_grab import grab_hwnd_bgra
+from hwnd_grab import grab_hwnd_bgra, grab_screen_bgra
 from windows import WindowInfo, WindowRestore, prepare_for_capture, refresh_geometry
 
 CREATE_NO_WINDOW = 0x08000000
@@ -204,20 +204,21 @@ class CaptureSession:
         self._stderr: list[str] = []
         self._err_thread: threading.Thread | None = None
         self.started_at: float | None = None
+        self._paused = threading.Event()
+        self._pause_started: float | None = None
+        self._paused_total = 0.0
         self._hwnd_mode = not cfg.window.is_desktop
         self._restore: WindowRestore | None = None
         self._grab_stop = threading.Event()
         self._grab_thread: threading.Thread | None = None
         self._frame_w = 0
         self._frame_h = 0
+        self._screen_x = 0
+        self._screen_y = 0
 
     def start(self) -> None:
         if not self.hw.has_libvvenc:
             raise RecorderError(self.hw.vvenc_skip_reason or "libvvenc is not available")
-        if not self._hwnd_mode:
-            desktop_ok = self.hw.has_ddagrab or self.hw.has_gdigrab
-            if not desktop_ok:
-                raise RecorderError(self.hw.capture_skip_reason or "no desktop grabber")
 
         self.cfg.output.parent.mkdir(parents=True, exist_ok=True)
         for p in (self.video_tmp, self.audio_tmp, self.cfg.output):
@@ -236,12 +237,14 @@ class CaptureSession:
                     f"Restored minimized window hwnd={self.cfg.window.hwnd} "
                     f"to {self._frame_w}x{self._frame_h} (will minimize again on stop)"
                 )
-            cmd = build_hwnd_cmd(
-                self.hw, self._frame_w, self._frame_h, fps, self.cfg.qp, self.video_tmp
-            )
         else:
-            cmd = build_video_cmd(self.cfg, self.hw, self.video_tmp)
+            geo = refresh_geometry(self.cfg.window)
+            self._screen_x, self._screen_y = geo.x, geo.y
+            self._frame_w, self._frame_h = geo.even_size
 
+        cmd = build_hwnd_cmd(
+            self.hw, self._frame_w, self._frame_h, fps, self.cfg.qp, self.video_tmp
+        )
         self.on_log("FFmpeg: " + " ".join(cmd))
 
         self.audio = AudioRecorder(
@@ -262,17 +265,42 @@ class CaptureSession:
             creationflags=flags,
         )
         self.started_at = time.time()
+        self._paused_total = 0.0
+        self._pause_started = None
+        self._paused.clear()
         self._err_thread = threading.Thread(target=self._drain_stderr, daemon=True)
         self._err_thread.start()
+        self._grab_thread = threading.Thread(
+            target=self._grab_loop, args=(fps,), daemon=True, name="frame-grab"
+        )
+        self._grab_thread.start()
         if self._hwnd_mode:
-            self._grab_thread = threading.Thread(
-                target=self._grab_loop, args=(fps,), daemon=True, name="hwnd-grab"
-            )
-            self._grab_thread.start()
             self.on_log(
                 f"HWND grab {self.cfg.window.exe or self.cfg.window.title} "
                 f"hwnd={self.cfg.window.hwnd} {self._frame_w}x{self._frame_h} @ {fps} fps"
             )
+        else:
+            self.on_log(f"Entire screen {self._frame_w}x{self._frame_h} @ {fps} fps")
+
+    def set_paused(self, paused: bool) -> None:
+        if paused and not self._paused.is_set():
+            self._paused.set()
+            self._pause_started = time.time()
+            if self.audio:
+                self.audio.set_paused(True)
+            self.on_log("Paused")
+        elif not paused and self._paused.is_set():
+            if self._pause_started is not None:
+                self._paused_total += time.time() - self._pause_started
+            self._pause_started = None
+            self._paused.clear()
+            if self.audio:
+                self.audio.set_paused(False)
+            self.on_log("Resumed")
+
+    @property
+    def paused(self) -> bool:
+        return self._paused.is_set()
 
     def _grab_loop(self, fps: int) -> None:
         period = 1.0 / max(1, fps)
@@ -284,7 +312,21 @@ class CaptureSession:
             while not self._grab_stop.is_set():
                 if self.proc.poll() is not None:
                     break
-                frame = grab_hwnd_bgra(hwnd, self._frame_w, self._frame_h)
+                if self._paused.is_set():
+                    next_t = time.perf_counter() + period
+                    self._grab_stop.wait(0.05)
+                    continue
+                if self._hwnd_mode:
+                    frame = grab_hwnd_bgra(hwnd, self._frame_w, self._frame_h)
+                else:
+                    frame = grab_screen_bgra(
+                        self._screen_x,
+                        self._screen_y,
+                        self._frame_w,
+                        self._frame_h,
+                        self._frame_w,
+                        self._frame_h,
+                    )
                 stdin.write(frame)
                 stdin.flush()
                 next_t += period
@@ -294,9 +336,9 @@ class CaptureSession:
                 else:
                     next_t = time.perf_counter()
         except (BrokenPipeError, OSError) as exc:
-            self.on_log(f"HWND grab stopped: {exc}")
+            self.on_log(f"Grab stopped: {exc}")
         except Exception as exc:
-            self.on_log(f"HWND grab error: {exc}")
+            self.on_log(f"Grab error: {exc}")
         finally:
             try:
                 stdin.close()
@@ -318,9 +360,14 @@ class CaptureSession:
     def elapsed(self) -> float:
         if not self.started_at:
             return 0.0
-        return time.time() - self.started_at
+        extra = self._paused_total
+        if self._paused.is_set() and self._pause_started is not None:
+            extra += time.time() - self._pause_started
+        return max(0.0, time.time() - self.started_at - extra)
 
     def stop(self) -> Path:
+        if self._paused.is_set():
+            self.set_paused(False)
         self._grab_stop.set()
         if self._grab_thread:
             self._grab_thread.join(timeout=5)
@@ -328,11 +375,7 @@ class CaptureSession:
         if self.proc and self.proc.poll() is None:
             try:
                 if self.proc.stdin and not self.proc.stdin.closed:
-                    if self._hwnd_mode:
-                        self.proc.stdin.close()
-                    else:
-                        self.proc.stdin.write(b"q")
-                        self.proc.stdin.flush()
+                    self.proc.stdin.close()
             except (BrokenPipeError, OSError):
                 pass
             try:

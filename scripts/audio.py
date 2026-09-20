@@ -123,6 +123,7 @@ class AudioRecorder:
         self.microphone = microphone
         self.loopback = loopback
         self._stop = threading.Event()
+        self._pause = threading.Event()
         self._thread: threading.Thread | None = None
         self._error: str | None = None
 
@@ -130,6 +131,12 @@ class AudioRecorder:
         self.wav_path.parent.mkdir(parents=True, exist_ok=True)
         self._thread = threading.Thread(target=self._run, name="wasapi-capture", daemon=True)
         self._thread.start()
+
+    def set_paused(self, paused: bool) -> None:
+        if paused:
+            self._pause.set()
+        else:
+            self._pause.clear()
 
     def stop(self, timeout: float = 8.0) -> None:
         self._stop.set()
@@ -196,6 +203,8 @@ class AudioRecorder:
                     if timed_out:
                         if self._stop.is_set():
                             break
+                        continue
+                    if self._pause.is_set():
                         continue
                     n = min(c.shape[0] for c in chunks)
                     mixed = chunks[0][:n].copy()

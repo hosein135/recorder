@@ -52,6 +52,8 @@ gdi32.StretchBlt.argtypes = [
     ctypes.c_int,
     wintypes.DWORD,
 ]
+user32.GetDC.restype = wintypes.HDC
+user32.GetDC.argtypes = [wintypes.HWND]
 user32.GetWindowDC.restype = wintypes.HDC
 user32.GetWindowDC.argtypes = [wintypes.HWND]
 user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
@@ -161,3 +163,37 @@ def grab_hwnd_bgra(hwnd: int, out_w: int, out_h: int) -> bytes:
         gdi32.DeleteDC(hdc_src)
         gdi32.DeleteDC(hdc_dst)
         user32.ReleaseDC(hwnd, hdc_win)
+
+
+def grab_screen_bgra(x: int, y: int, src_w: int, src_h: int, out_w: int, out_h: int) -> bytes:
+    """BitBlt the virtual screen (Entire screen). Coords may be negative."""
+    src_w = _even(src_w)
+    src_h = _even(src_h)
+    if src_w < 2 or src_h < 2:
+        return b"\x00" * (out_w * out_h * 4)
+    hdc_screen = user32.GetDC(0)
+    if not hdc_screen:
+        raise RuntimeError("GetDC(desktop) failed")
+    hdc_src = gdi32.CreateCompatibleDC(hdc_screen)
+    hdc_dst = gdi32.CreateCompatibleDC(hdc_screen)
+    try:
+        src = _Dib(hdc_src, src_w, src_h)
+        gdi32.BitBlt(hdc_src, 0, 0, src_w, src_h, hdc_screen, int(x), int(y), SRCCOPY)
+        if src_w == out_w and src_h == out_h:
+            data = src.to_bytes()
+        else:
+            dst = _Dib(hdc_dst, out_w, out_h)
+            gdi32.SetStretchBltMode(hdc_dst, 4)
+            gdi32.StretchBlt(
+                hdc_dst, 0, 0, out_w, out_h, hdc_src, 0, 0, src_w, src_h, SRCCOPY
+            )
+            data = dst.to_bytes()
+            gdi32.SelectObject(hdc_dst, dst._old)
+            gdi32.DeleteObject(dst.hbmp)
+        gdi32.SelectObject(hdc_src, src._old)
+        gdi32.DeleteObject(src.hbmp)
+        return data
+    finally:
+        gdi32.DeleteDC(hdc_src)
+        gdi32.DeleteDC(hdc_dst)
+        user32.ReleaseDC(0, hdc_screen)

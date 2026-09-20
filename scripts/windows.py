@@ -34,6 +34,9 @@ WS_EX_APPWINDOW = 0x00040000
 WS_EX_NOACTIVATE = 0x08000000
 GW_OWNER = 4
 GA_ROOT = 2
+GA_ROOTOWNER = 3
+GW_HWNDNEXT = 2
+GW_CHILD = 5
 SW_SHOWNORMAL = 1
 SW_SHOWMINIMIZED = 2
 SW_SHOWNOACTIVATE = 4
@@ -100,6 +103,17 @@ class RECT(ctypes.Structure):
 
 class POINT(ctypes.Structure):
     _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+
+user32.WindowFromPoint.argtypes = [POINT]
+user32.WindowFromPoint.restype = wintypes.HWND
+user32.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
+user32.GetAncestor.restype = wintypes.HWND
+user32.GetLastActivePopup.argtypes = [wintypes.HWND]
+user32.GetLastActivePopup.restype = wintypes.HWND
+user32.GetDesktopWindow.restype = wintypes.HWND
+user32.GetTopWindow.argtypes = [wintypes.HWND]
+user32.GetTopWindow.restype = wintypes.HWND
 
 
 class WINDOWPLACEMENT(ctypes.Structure):
@@ -297,7 +311,7 @@ def _virtual_screen() -> WindowInfo:
         x, y = 0, 0
     return WindowInfo(
         hwnd=0,
-        title="desktop",
+        title="Entire screen",
         pid=0,
         exe="",
         x=x,
@@ -324,7 +338,8 @@ def _is_self(hwnd: int, pid: int, title: str, class_name: str) -> bool:
     return False
 
 
-def _is_candidate(hwnd: int) -> bool:
+def _is_alt_tab_window(hwnd: int) -> bool:
+    """Same membership rules as the Windows Alt+Tab switcher (plus browsers)."""
     if not user32.IsWindow(hwnd):
         return False
     class_name = _class_name(hwnd)
@@ -342,90 +357,125 @@ def _is_candidate(hwnd: int) -> bool:
     is_browser = exe in BROWSERS or class_name.startswith("Chrome_WidgetWin")
     minimized = bool(user32.IsIconic(hwnd))
     visible = bool(user32.IsWindowVisible(hwnd))
-    # Minimized windows keep WS_VISIBLE; still include them if iconic.
-    if not visible and not minimized and not is_browser:
+    if not visible and not minimized:
+        return False
+    if _is_cloaked(hwnd) and not minimized and not is_browser:
         return False
 
-    owner = user32.GetWindow(hwnd, GW_OWNER)
     ex = _exstyle(hwnd)
-    tool = bool(ex & WS_EX_TOOLWINDOW) and not bool(ex & WS_EX_APPWINDOW)
-    # Skip tiny owner-only tool popups, but never skip browser frames.
-    if tool and not is_browser:
+    if (ex & WS_EX_TOOLWINDOW) and not (ex & WS_EX_APPWINDOW) and not is_browser:
         return False
-    if owner and not is_browser and not (ex & WS_EX_APPWINDOW):
-        if not title:
-            return False
+    owner = user32.GetWindow(hwnd, GW_OWNER)
+    if owner and not (ex & WS_EX_APPWINDOW) and not is_browser:
+        return False
 
-    x, y, w, h = _normal_rect(hwnd)
+    root_owner = user32.GetAncestor(hwnd, GA_ROOTOWNER) or hwnd
+    walk = int(root_owner)
+    for _ in range(16):
+        popup = int(user32.GetLastActivePopup(walk) or walk)
+        if popup == walk or user32.IsWindowVisible(popup):
+            break
+        walk = popup
+    if int(hwnd) != walk and not (ex & WS_EX_APPWINDOW) and not is_browser:
+        return False
+
+    _x, _y, w, h = _normal_rect(hwnd)
     if is_browser:
-        if w < 16 or h < 16:
-            return False
-        return True
-
+        return w >= 16 and h >= 16
     if not title:
         return False
-    if w < 32 or h < 32:
-        return False
-    return True
+    return w >= 32 and h >= 32
+
+
+def _info_from_hwnd(hwnd: int) -> WindowInfo | None:
+    hwnd = int(hwnd)
+    if not _is_alt_tab_window(hwnd):
+        return None
+    pid_dw = wintypes.DWORD(0)
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid_dw))
+    pid = int(pid_dw.value)
+    exe = _process_image(pid)
+    title = _window_title(hwnd) or f"{exe or 'window'} hwnd={hwnd}"
+    x, y, w, h = _normal_rect(hwnd)
+    return WindowInfo(
+        hwnd=hwnd,
+        title=title,
+        pid=pid,
+        exe=exe,
+        x=x,
+        y=y,
+        width=w,
+        height=h,
+        class_name=_class_name(hwnd),
+        minimized=bool(user32.IsIconic(hwnd)),
+        cloaked=_is_cloaked(hwnd),
+    )
 
 
 def list_windows() -> list[WindowInfo]:
+    """Alt+Tab order: Z-order from front to back, Entire screen first."""
     found: list[WindowInfo] = []
     seen: set[int] = set()
 
     def _add(hwnd: int) -> None:
         hwnd = int(hwnd)
-        if hwnd in seen or not _is_candidate(hwnd):
+        if hwnd in seen:
+            return
+        info = _info_from_hwnd(hwnd)
+        if info is None:
             return
         seen.add(hwnd)
-        pid_dw = wintypes.DWORD(0)
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid_dw))
-        pid = int(pid_dw.value)
-        exe = _process_image(pid)
-        title = _window_title(hwnd)
-        if not title:
-            title = f"{exe or 'window'} hwnd={hwnd}"
-        x, y, w, h = _normal_rect(hwnd)
-        found.append(
-            WindowInfo(
-                hwnd=hwnd,
-                title=title,
-                pid=pid,
-                exe=exe,
-                x=x,
-                y=y,
-                width=w,
-                height=h,
-                class_name=_class_name(hwnd),
-                minimized=bool(user32.IsIconic(hwnd)),
-                cloaked=_is_cloaked(hwnd),
-            )
-        )
+        found.append(info)
+
+    desktop = user32.GetDesktopWindow()
+    hwnd = user32.GetTopWindow(desktop)
+    while hwnd:
+        _add(hwnd)
+        hwnd = user32.GetWindow(hwnd, GW_HWNDNEXT)
 
     @WNDENUMPROC
-    def _cb(hwnd: int, _lparam: int) -> bool:
-        _add(hwnd)
+    def _cb(h: int, _lparam: int) -> bool:
+        _add(h)
         return True
 
     user32.EnumWindows(_cb, 0)
-
-    # Alt-Tab style walk (GetWindow GW_HWNDNEXT) sometimes sees windows
-    # EnumWindows skips when a shell hook is late.
-    try:
-        hwnd = user32.GetTopWindow(0)
-        while hwnd:
-            _add(hwnd)
-            hwnd = user32.GetWindow(hwnd, 2)  # GW_HWNDNEXT
-    except OSError:
-        pass
-
-    def _sort_key(w: WindowInfo) -> tuple:
-        browser = 0 if w.exe.lower() in BROWSERS else 1
-        min_key = 1 if w.minimized else 0
-        return (min_key, browser, w.exe.lower(), w.title.lower())
-
-    found.sort(key=_sort_key)
     return [_virtual_screen()] + found
+
+
+def window_at_point(x: int, y: int, exclude_hwnds: set[int] | None = None) -> WindowInfo | None:
+    """Top-level window under a screen point (what you would Alt+Tab to)."""
+    exclude_hwnds = exclude_hwnds or set()
+    pt = POINT(int(x), int(y))
+    hwnd = int(user32.WindowFromPoint(pt) or 0)
+    if not hwnd:
+        return None
+    root = int(user32.GetAncestor(hwnd, GA_ROOT) or hwnd)
+    if root in exclude_hwnds:
+        return None
+    info = _info_from_hwnd(root)
+    if info is not None:
+        return info
+    if root and root not in exclude_hwnds and user32.IsWindow(root):
+        pid_dw = wintypes.DWORD(0)
+        user32.GetWindowThreadProcessId(root, ctypes.byref(pid_dw))
+        pid = int(pid_dw.value)
+        exe = _process_image(pid)
+        title = _window_title(root) or exe or f"hwnd={root}"
+        x0, y0, w, h = _normal_rect(root)
+        return WindowInfo(
+            hwnd=root,
+            title=title,
+            pid=pid,
+            exe=exe,
+            x=x0,
+            y=y0,
+            width=w,
+            height=h,
+            class_name=_class_name(root),
+            minimized=bool(user32.IsIconic(root)),
+            cloaked=_is_cloaked(root),
+        )
+    return None
 
 
 def refresh_geometry(info: WindowInfo) -> WindowInfo:
@@ -485,3 +535,24 @@ def prepare_for_capture(info: WindowInfo) -> WindowRestore:
         user32.RedrawWindow(hwnd, None, None, 0x0103)  # RDW_INVALIDATE|ERASE|UPDATENOW
         time.sleep(0.05)
     return token
+
+
+user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
+user32.GetCursorPos.restype = wintypes.BOOL
+user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+user32.GetAsyncKeyState.restype = ctypes.c_short
+
+
+def cursor_pos() -> tuple[int, int]:
+    pt = POINT()
+    if not user32.GetCursorPos(ctypes.byref(pt)):
+        return 0, 0
+    return int(pt.x), int(pt.y)
+
+
+def left_button_down() -> bool:
+    return bool(user32.GetAsyncKeyState(0x01) & 0x8000)
+
+
+def escape_pressed() -> bool:
+    return bool(user32.GetAsyncKeyState(0x1B) & 0x0001)
