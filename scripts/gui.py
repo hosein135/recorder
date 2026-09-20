@@ -152,7 +152,7 @@ class RecorderApp(tk.Tk):
         filt.pack(side="left", fill="x", expand=True)
         ttk.Label(
             left,
-            text="Pick a window the way you share a screen, or click one on the display.",
+            text="Pick a window like a screen share. It stays on screen - you can minimize or maximize while recording.",
             style="Muted.TLabel",
         ).pack(anchor="w", padx=8)
 

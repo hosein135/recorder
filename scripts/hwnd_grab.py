@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Grab BGRA frames from a specific HWND (PrintWindow / BitBlt).
 
-This is window-accurate: overlapping windows are not in the shot, and after
-prepare_for_capture() a previously minimized window still has a bitmap.
-PW_RENDERFULLCONTENT is required for Chrome's GPU-composited surface.
+Same idea as Mirillis Action! Window / Selected application mode: capture
+that window in place. The HWND is never restored, cloaked, moved, or
+forced on top — the user can still see it, minimize it, and maximize it.
+Overlapping windows are not in the shot (PW_RENDERFULLCONTENT). A
+minimized window is not composed by DWM, so recording holds the last
+live frame until the user shows it again.
 """
 
 from __future__ import annotations
@@ -13,7 +16,7 @@ from ctypes import wintypes
 
 import numpy as np
 
-from windows import grab_source_rect
+from windows import grab_source_rect, window_is_maximized, window_is_minimized
 
 user32 = ctypes.windll.user32
 gdi32 = ctypes.windll.gdi32
@@ -98,6 +101,22 @@ def _even(n: int) -> int:
     return max(2, n - (n % 2))
 
 
+def _fit_rect(src_w: int, src_h: int, dst_w: int, dst_h: int) -> tuple[int, int, int, int]:
+    """Letterbox dest rect so maximize/restore keep aspect ratio."""
+    if src_w < 2 or src_h < 2:
+        return 0, 0, dst_w, dst_h
+    scale = min(dst_w / src_w, dst_h / src_h)
+    nw = _even(max(2, int(src_w * scale)))
+    nh = _even(max(2, int(src_h * scale)))
+    if nw > dst_w:
+        nw = _even(dst_w)
+    if nh > dst_h:
+        nh = _even(dst_h)
+    x = max(0, (dst_w - nw) // 2)
+    y = max(0, (dst_h - nh) // 2)
+    return x, y, nw, nh
+
+
 class _Dib:
     def __init__(self, hdc: int, width: int, height: int) -> None:
         self.width = width
@@ -124,15 +143,18 @@ class _Dib:
         return ctypes.string_at(self.bits.value, self.nbytes())
 
 
-def grab_hwnd_bgra(hwnd: int, out_w: int, out_h: int) -> bytes:
-    """Return one BGRA frame of out_w x out_h from hwnd (stretched if resized)."""
+def grab_hwnd_bgra(hwnd: int, out_w: int, out_h: int, *, letterbox: bool = False) -> bytes:
+    """Return one BGRA frame of out_w x out_h from hwnd.
+
+    letterbox=True keeps aspect ratio when the user maximizes or resizes
+    (bars instead of stretching). Thumbs keep letterbox=False.
+    """
     if not user32.IsWindow(hwnd):
         raise RuntimeError("Window closed during capture")
     _x, _y, src_w, src_h = grab_source_rect(hwnd)
     src_w = _even(src_w)
     src_h = _even(src_h)
     if src_w < 2 or src_h < 2:
-        # Still iconic or not composed - emit black so encode keeps going.
         return b"\x00" * (out_w * out_h * 4)
 
     hdc_win = user32.GetWindowDC(hwnd)
@@ -151,10 +173,18 @@ def grab_hwnd_bgra(hwnd: int, out_w: int, out_h: int) -> bytes:
             data = src.to_bytes()
         else:
             dst = _Dib(hdc_dst, out_w, out_h)
+            if dst.bits.value:
+                ctypes.memset(dst.bits.value, 0, dst.nbytes())
             gdi32.SetStretchBltMode(hdc_dst, 4)  # HALFTONE
-            gdi32.StretchBlt(
-                hdc_dst, 0, 0, out_w, out_h, hdc_src, 0, 0, src_w, src_h, SRCCOPY
-            )
+            if letterbox:
+                x, y, nw, nh = _fit_rect(src_w, src_h, out_w, out_h)
+                gdi32.StretchBlt(
+                    hdc_dst, x, y, nw, nh, hdc_src, 0, 0, src_w, src_h, SRCCOPY
+                )
+            else:
+                gdi32.StretchBlt(
+                    hdc_dst, 0, 0, out_w, out_h, hdc_src, 0, 0, src_w, src_h, SRCCOPY
+                )
             data = dst.to_bytes()
             gdi32.SelectObject(hdc_dst, dst._old)
             gdi32.DeleteObject(dst.hbmp)
@@ -165,6 +195,27 @@ def grab_hwnd_bgra(hwnd: int, out_w: int, out_h: int) -> bytes:
         gdi32.DeleteDC(hdc_src)
         gdi32.DeleteDC(hdc_dst)
         user32.ReleaseDC(hwnd, hdc_win)
+
+
+class WindowGrabber:
+    """Independent HWND capture. Never changes the target's min/max/z-order."""
+
+    def __init__(self, hwnd: int, out_w: int, out_h: int) -> None:
+        self.hwnd = hwnd
+        self.out_w = out_w
+        self.out_h = out_h
+        self._last = b"\x00" * (out_w * out_h * 4)
+
+    def grab(self) -> tuple[bytes, str | None]:
+        if not user32.IsWindow(self.hwnd):
+            raise RuntimeError("Window closed during capture")
+        if window_is_minimized(self.hwnd):
+            return self._last, "minimized"
+        frame = grab_hwnd_bgra(self.hwnd, self.out_w, self.out_h, letterbox=True)
+        self._last = frame
+        if window_is_maximized(self.hwnd):
+            return frame, "maximized"
+        return frame, "open"
 
 
 def grab_screen_bgra(x: int, y: int, src_w: int, src_h: int, out_w: int, out_h: int) -> bytes:

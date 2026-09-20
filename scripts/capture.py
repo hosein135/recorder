@@ -14,8 +14,8 @@ from typing import Callable
 
 from audio import AudioDevice, AudioMode, AudioRecorder
 from hw_detect import HardwareProfile
-from hwnd_grab import grab_hwnd_bgra, grab_screen_bgra
-from windows import WindowInfo, WindowRestore, prepare_for_capture, refresh_geometry
+from hwnd_grab import WindowGrabber, grab_screen_bgra
+from windows import WindowInfo, refresh_geometry, window_is_minimized
 
 CREATE_NO_WINDOW = 0x08000000
 
@@ -242,13 +242,14 @@ class CaptureSession:
         self._pause_started: float | None = None
         self._paused_total = 0.0
         self._hwnd_mode = not cfg.window.is_desktop
-        self._restore: WindowRestore | None = None
+        self._grabber: WindowGrabber | None = None
         self._grab_stop = threading.Event()
         self._grab_thread: threading.Thread | None = None
         self._frame_w = 0
         self._frame_h = 0
         self._screen_x = 0
         self._screen_y = 0
+        self._win_state: str | None = None
 
     def start(self) -> None:
         if not self.hw.has_libvvenc:
@@ -267,14 +268,16 @@ class CaptureSession:
         flags = CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
         if self._hwnd_mode:
-            self._restore = prepare_for_capture(self.cfg.window)
+            if not self.cfg.window.hwnd:
+                raise RecorderError("That window no longer exists.")
             geo = refresh_geometry(self.cfg.window)
             self._frame_w, self._frame_h = geo.even_size
-            if self._restore.was_minimized:
+            self._grabber = WindowGrabber(self.cfg.window.hwnd, self._frame_w, self._frame_h)
+            if window_is_minimized(self.cfg.window.hwnd):
                 self.on_log(
-                    f"Minimized window hwnd={self.cfg.window.hwnd} "
-                    f"kept composable at {self._frame_w}x{self._frame_h} "
-                    f"(restored on stop if it was minimized)"
+                    "Target is minimized. Show it to capture live frames - "
+                    "Windows (and Action! Window mode) do not compose minimized windows. "
+                    "The window stays under your control; this recorder will not restore or hide it."
                 )
         else:
             geo = refresh_geometry(self.cfg.window)
@@ -317,8 +320,9 @@ class CaptureSession:
         self._grab_thread.start()
         if self._hwnd_mode:
             self.on_log(
-                f"HWND grab {self.cfg.window.exe or self.cfg.window.title} "
-                f"hwnd={self.cfg.window.hwnd} {self._frame_w}x{self._frame_h} @ {fps} fps"
+                f"Window capture {self.cfg.window.exe or self.cfg.window.title} "
+                f"hwnd={self.cfg.window.hwnd} {self._frame_w}x{self._frame_h} @ {fps} fps "
+                f"(window stays visible; you can min/max it)"
             )
         else:
             self.on_log(f"Entire screen {self._frame_w}x{self._frame_h} @ {fps} fps")
@@ -345,7 +349,6 @@ class CaptureSession:
 
     def _grab_loop(self, fps: int) -> None:
         period = 1.0 / max(1, fps)
-        hwnd = self.cfg.window.hwnd
         assert self.proc and self.proc.stdin
         stdin = self.proc.stdin
         next_t = time.perf_counter()
@@ -358,14 +361,24 @@ class CaptureSession:
                     self._grab_stop.wait(0.05)
                     continue
                 if self._hwnd_mode:
-                    if self._restore is not None:
-                        hidden_before = self._restore._cloaked_by_us
-                        self._restore.ensure_composing()
-                        if self._restore._cloaked_by_us and not hidden_before:
+                    assert self._grabber is not None
+                    frame, state = self._grabber.grab()
+                    if state != self._win_state:
+                        prev = self._win_state
+                        self._win_state = state
+                        if prev is None:
+                            pass
+                        elif state == "minimized":
                             self.on_log(
-                                "Selected window was minimized - capture continues in the background"
+                                "Window minimized - holding last frame. "
+                                "Restore it whenever you want; capture does not steal the window."
                             )
-                    frame = grab_hwnd_bgra(hwnd, self._frame_w, self._frame_h)
+                        elif state == "maximized":
+                            self.on_log(
+                                "Window maximized - capture continues (letterboxed to recording size)."
+                            )
+                        elif state == "open":
+                            self.on_log("Window restored - live capture resumed.")
                 else:
                     frame = grab_screen_bgra(
                         self._screen_x,
@@ -431,13 +444,6 @@ class CaptureSession:
             except subprocess.TimeoutExpired:
                 self.proc.kill()
                 self.proc.wait(timeout=5)
-
-        if self._restore is not None:
-            try:
-                self._restore.revert()
-            except Exception as exc:
-                self.on_log(f"Could not restore window state: {exc}")
-            self._restore = None
 
         audio_err: str | None = None
         if self.audio:
