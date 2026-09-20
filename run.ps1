@@ -1,4 +1,4 @@
-#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 $ErrorActionPreference = 'Stop'
 
 # Bootstrap + hardware-aware H.266/VVC window recorder.
@@ -213,7 +213,7 @@ function Show-HostHardwareInventory {
         Write-Host "  CPU vendor : $cpuVendor" -ForegroundColor Gray
         Write-Host "  Cores      : $cores physical / $logical logical threads" -ForegroundColor Gray
         Write-Host "  RAM        : ~$memGB GB" -ForegroundColor Gray
-        Write-Host "  Class      : $cpuClass — libvvenc H.266 threads scale from logical count" -ForegroundColor $classColor
+        Write-Host "  Class      : $cpuClass - libvvenc H.266 threads scale from logical count" -ForegroundColor $classColor
     } catch {
         Write-Host "  CPU query failed: $($_.Exception.Message)" -ForegroundColor Yellow
     }
@@ -268,7 +268,7 @@ function Show-HostHardwareInventory {
         if ($LASTEXITCODE -eq 0) { $script:HostInventory.NvidiaSmi = $true }
         else { Write-Host "  nvidia-smi present but -L failed (driver issue?)" -ForegroundColor Yellow }
     } else {
-        Write-Host "  nvidia-smi: not on PATH — NVENC exists on NVIDIA cards but cannot encode H.266/VVC" -ForegroundColor Yellow
+        Write-Host "  nvidia-smi: not on PATH - NVENC exists on NVIDIA cards but cannot encode H.266/VVC" -ForegroundColor Yellow
     }
 }
 
@@ -312,10 +312,10 @@ function Show-RecorderInvolvement {
     Write-Host "  Encode:" -ForegroundColor White
     Write-Host "   - libvvenc (H.266 / VVC) on all $threads logical CPUs" -ForegroundColor Green
     if ($nvidia.Count -gt 0) {
-        Write-Host "   - NVENC on $($nvidia[0].Name) cannot encode VVC — not selected" -ForegroundColor DarkGray
+        Write-Host "   - NVENC on $($nvidia[0].Name) cannot encode VVC - not selected" -ForegroundColor DarkGray
     }
     if ($intel.Count -gt 0) {
-        Write-Host "   - Quick Sync on $($intel[0].Name) has VVC decode, not encode — not selected" -ForegroundColor DarkGray
+        Write-Host "   - Quick Sync on $($intel[0].Name) has VVC decode, not encode - not selected" -ForegroundColor DarkGray
     }
 
     $hwScript = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "scripts\hw_detect.py"))
@@ -454,7 +454,7 @@ if (-not $pythonCmd) {
 }
 & $pythonCmd --version
 
-## 5. FFMPEG (full Gyan build — essentials omits libvvenc)
+## 5. FFMPEG (full Gyan build - essentials omits libvvenc)
 Write-Section "Bootstrap: FFmpeg (full build, libvvenc)"
 Ensure-WingetPackage -Id "Gyan.FFmpeg" -Name "FFmpeg" -Version $ffmpegTargetVersion -CommandName "ffmpeg" -WingetPackagesRoot $wingetPackagesRoot
 
