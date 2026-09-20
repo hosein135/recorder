@@ -101,6 +101,8 @@ class RecorderApp(tk.Tk):
         self._syncing_rates = False
         self._min_labels: dict[str, tk.Label] = {}
         self._min_floors: dict[str, int] = {}
+        self._setting_spins: dict[str, tuple[ttk.Spinbox, tk.StringVar]] = {}
+        self._rate_source = "av"
 
         self._style()
         self._build()
@@ -167,7 +169,10 @@ class RecorderApp(tk.Tk):
             width=12,
             anchor="w",
         ).pack(side="left", padx=(10, 4), pady=8)
-        ttk.Spinbox(rowf, textvariable=var, from_=lo, to=hi, increment=step, width=8).pack(side="left")
+        spin = ttk.Spinbox(rowf, textvariable=var, from_=lo, to=hi, increment=step, width=8)
+        spin.pack(side="left")
+        self._setting_spins[key] = (spin, var)
+        spin.bind("<FocusOut>", lambda _e, s=spin, v=var: v.set(str(s.get()).strip()), add="+")
         tk.Label(rowf, text=unit, bg=PANEL2, fg=MUTED, font=("Segoe UI", 8), anchor="w").pack(
             side="left", padx=(6, 8)
         )
@@ -578,6 +583,8 @@ class RecorderApp(tk.Tk):
                 font=("Segoe UI Semibold", 13),
             )
             self._tab_rules[name].configure(bg=ACCENT if active else BG)
+        if self._current_page == "settings":
+            self._commit_settings()
         self._pages[key].pack(fill="both", expand=True)
         prev = self._current_page
         self._current_page = key
@@ -747,6 +754,7 @@ class RecorderApp(tk.Tk):
     def _on_audio_or_video_rate(self) -> None:
         if self._syncing_rates:
             return
+        self._rate_source = "av"
         self._syncing_rates = True
         try:
             audio = self._parse_int(self.audio_kbps_var, DEFAULT_AUDIO_KBPS)
@@ -759,6 +767,7 @@ class RecorderApp(tk.Tk):
     def _on_total_rate(self) -> None:
         if self._syncing_rates:
             return
+        self._rate_source = "total"
         self._syncing_rates = True
         try:
             audio = self._parse_int(self.audio_kbps_var, DEFAULT_AUDIO_KBPS)
@@ -788,6 +797,28 @@ class RecorderApp(tk.Tk):
             else:
                 lbl.configure(bg=CHIP_BG, fg=MUTED)
 
+    def _commit_settings(self) -> None:
+        if not self._setting_spins:
+            return
+        try:
+            self.focus_set()
+        except tk.TclError:
+            pass
+        self.update_idletasks()
+        self._syncing_rates = True
+        try:
+            for spin, var in self._setting_spins.values():
+                try:
+                    var.set(str(spin.get()).strip())
+                except tk.TclError:
+                    pass
+        finally:
+            self._syncing_rates = False
+        if self._rate_source == "total":
+            self._on_total_rate()
+        else:
+            self._on_audio_or_video_rate()
+
     def _read_int_setting(
         self,
         var: tk.StringVar,
@@ -810,6 +841,7 @@ class RecorderApp(tk.Tk):
         return n
 
     def _read_rate_settings(self) -> tuple[int, int, int, int] | None:
+        self._commit_settings()
         audio_kbps = self._read_int_setting(
             self.audio_kbps_var, "Audio kb/s", AUDIO_KBPS_MIN, AUDIO_KBPS_MAX, "48"
         )
@@ -831,6 +863,10 @@ class RecorderApp(tk.Tk):
         )
         if total_kbps is None:
             return None
+        if self._rate_source == "total":
+            video_kbps = max(VIDEO_KBPS_MIN, min(VIDEO_KBPS_MAX, total_kbps - audio_kbps))
+        else:
+            total_kbps = audio_kbps + video_kbps
         if audio_kbps < MIN_USEFUL_AUDIO_KBPS:
             if not messagebox.askyesno(
                 "Audio may be too thin",
@@ -1186,6 +1222,7 @@ class RecorderApp(tk.Tk):
             messagebox.showwarning("Recorder", "Select a window (or Entire screen).")
             return
         try:
+            self._commit_settings()
             fps = int(self.fps_var.get().strip())
         except ValueError:
             messagebox.showwarning("Recorder", "FPS must be a whole number you type, e.g. 30 or 60.")

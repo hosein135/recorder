@@ -111,6 +111,9 @@ def default_output_path(root: Path, window: WindowInfo) -> Path:
 
 def _vvenc_tail(hw: HardwareProfile, fps: int, video_kbps: int, video_path: Path) -> list[str]:
     kbps = clamp_video_kbps(video_kbps)
+    # libvvenc defaults to -qp 32. Older FFmpeg wrappers then pass bitrate=0
+    # (fixed QP) unless qp is -1. Without this, Data rate / Total never change the file.
+    maxrate = kbps * 2
     return [
         "-vf",
         "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p10le",
@@ -120,8 +123,14 @@ def _vvenc_tail(hw: HardwareProfile, fps: int, video_kbps: int, video_path: Path
         "libvvenc",
         "-preset",
         hw.recommended_vvenc_preset(fps),
+        "-qp",
+        "-1",
         "-b:v",
         f"{kbps}k",
+        "-maxrate",
+        f"{maxrate}k",
+        "-bufsize",
+        f"{kbps * 2}k",
         "-qpa",
         "1",
         "-period",
@@ -231,16 +240,22 @@ def build_mux_cmd(
         str(video_path),
         "-i",
         str(audio_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
         "-c:v",
         "copy",
+        "-filter:a",
+        f"aresample={rate}",
         "-c:a",
         "libopus",
-        "-b:a",
-        f"{kbps}k",
         "-application",
         "audio",
         "-vbr",
         "on",
+        "-b:a",
+        f"{kbps}k",
         "-ar",
         str(rate),
         "-shortest",
@@ -328,6 +343,7 @@ class CaptureSession:
             wav_path=self.audio_tmp,
             microphone=self.cfg.microphone,
             loopback=self.cfg.loopback,
+            sample_rate=snap_opus_rate(self.cfg.sample_rate),
         )
         self.audio.start()
         total = clamp_video_kbps(self.cfg.video_kbps) + clamp_audio_kbps(self.cfg.audio_kbps)

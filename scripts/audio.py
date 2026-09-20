@@ -110,6 +110,12 @@ def _pcm16(frames: np.ndarray) -> bytes:
     return (clipped * 32767.0).astype(np.int16).tobytes()
 
 
+def _snap_wav_rate(n: int) -> int:
+    allowed = (8000, 12000, 16000, 24000, 48000)
+    n = max(8000, min(48000, int(n)))
+    return min(allowed, key=lambda rate: abs(rate - n))
+
+
 class AudioRecorder:
     def __init__(
         self,
@@ -117,11 +123,13 @@ class AudioRecorder:
         wav_path: Path,
         microphone: AudioDevice | None = None,
         loopback: AudioDevice | None = None,
+        sample_rate: int = SAMPLE_RATE,
     ) -> None:
         self.mode = mode
         self.wav_path = wav_path
         self.microphone = microphone
         self.loopback = loopback
+        self.sample_rate = _snap_wav_rate(sample_rate)
         self._stop = threading.Event()
         self._pause = threading.Event()
         self._thread: threading.Thread | None = None
@@ -168,7 +176,7 @@ class AudioRecorder:
             def _pump(device: AudioDevice, q: queue.Queue) -> None:
                 try:
                     with _open_mic(device).recorder(
-                        samplerate=SAMPLE_RATE, channels=2, blocksize=CHUNK
+                        samplerate=self.sample_rate, channels=2, blocksize=CHUNK
                     ) as rec:
                         while not self._stop.is_set():
                             frames = _to_stereo(
@@ -190,7 +198,7 @@ class AudioRecorder:
             with wave.open(str(self.wav_path), "wb") as wf:
                 wf.setnchannels(2)
                 wf.setsampwidth(2)
-                wf.setframerate(SAMPLE_RATE)
+                wf.setframerate(self.sample_rate)
                 while not self._stop.is_set() or any(not q.empty() for q in queues):
                     chunks: list[np.ndarray] = []
                     timed_out = False
