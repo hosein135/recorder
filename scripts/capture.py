@@ -14,7 +14,8 @@ from typing import Callable
 
 from audio import AudioDevice, AudioMode, AudioRecorder
 from hw_detect import HardwareProfile
-from windows import WindowInfo, refresh_geometry
+from hwnd_grab import grab_hwnd_bgra
+from windows import WindowInfo, WindowRestore, prepare_for_capture, refresh_geometry
 
 CREATE_NO_WINDOW = 0x08000000
 
@@ -56,6 +57,63 @@ def default_output_path(root: Path, window: WindowInfo) -> Path:
     return root / f"{name}_{stamp}.mp4"
 
 
+def _vvenc_tail(hw: HardwareProfile, fps: int, qp: int, video_path: Path) -> list[str]:
+    return [
+        "-vf",
+        "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p10le",
+        "-r",
+        str(fps),
+        "-c:v",
+        "libvvenc",
+        "-preset",
+        hw.recommended_vvenc_preset(fps),
+        "-qp",
+        str(qp),
+        "-qpa",
+        "1",
+        "-period",
+        "1",
+        "-pix_fmt",
+        "yuv420p10le",
+        "-tag:v",
+        "vvc1",
+        "-threads",
+        str(hw.recommended_vvenc_threads()),
+        "-an",
+        str(video_path),
+    ]
+
+
+def build_hwnd_cmd(
+    hw: HardwareProfile,
+    width: int,
+    height: int,
+    fps: int,
+    qp: int,
+    video_path: Path,
+) -> list[str]:
+    ffmpeg = _ffmpeg(hw)
+    return [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "info",
+        "-stats",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "bgra",
+        "-s",
+        f"{width}x{height}",
+        "-framerate",
+        str(fps),
+        "-i",
+        "-",
+        *_vvenc_tail(hw, fps, qp, video_path),
+    ]
+
+
 def build_video_cmd(
     cfg: RecordConfig,
     hw: HardwareProfile,
@@ -64,9 +122,6 @@ def build_video_cmd(
     ffmpeg = _ffmpeg(hw)
     win = refresh_geometry(cfg.window)
     fps = max(1, min(120, int(cfg.fps)))
-    preset = hw.recommended_vvenc_preset(fps)
-    threads = str(hw.recommended_vvenc_threads())
-    w, h = win.even_size
 
     cmd: list[str] = [
         ffmpeg,
@@ -80,72 +135,25 @@ def build_video_cmd(
     ]
 
     if win.is_desktop and hw.has_ddagrab:
-        # DXGI Desktop Duplication — GPU copies the composed desktop.
         cmd += [
             "-f",
             "lavfi",
             "-i",
             f"ddagrab=0:framerate={fps}:draw_mouse=1,hwdownload,format=bgra",
         ]
-    elif win.is_desktop:
-        cmd += [
-            "-f",
-            "gdigrab",
-            "-framerate",
-            str(fps),
-            "-draw_mouse",
-            "1",
-            "-i",
-            "desktop",
-        ]
     else:
-        # Crop the desktop to the window rect so GPU-composited content
-        # (D3D/UWP) is visible. title= follows a moving window but often
-        # records a black frame for hardware-accelerated clients.
         cmd += [
             "-f",
             "gdigrab",
             "-framerate",
             str(fps),
-            "-offset_x",
-            str(win.x),
-            "-offset_y",
-            str(win.y),
-            "-video_size",
-            f"{w}x{h}",
-            "-show_region",
-            "1",
             "-draw_mouse",
             "1",
             "-i",
             "desktop",
         ]
 
-    vf = "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p10le"
-    cmd += [
-        "-vf",
-        vf,
-        "-r",
-        str(fps),
-        "-c:v",
-        "libvvenc",
-        "-preset",
-        preset,
-        "-qp",
-        str(cfg.qp),
-        "-qpa",
-        "1",
-        "-period",
-        "1",
-        "-pix_fmt",
-        "yuv420p10le",
-        "-tag:v",
-        "vvc1",
-        "-threads",
-        threads,
-        "-an",
-        str(video_path),
-    ]
+    cmd += _vvenc_tail(hw, fps, cfg.qp, video_path)
     return cmd
 
 
@@ -189,30 +197,53 @@ class CaptureSession:
         self.cfg = cfg
         self.hw = hw
         self.on_log = on_log or (lambda _m: None)
-        self.proc: subprocess.Popen[str] | None = None
+        self.proc: subprocess.Popen[bytes] | None = None
         self.audio: AudioRecorder | None = None
         self.video_tmp = cfg.output.with_suffix(".video.tmp.mp4")
         self.audio_tmp = cfg.output.with_suffix(".audio.tmp.wav")
         self._stderr: list[str] = []
         self._err_thread: threading.Thread | None = None
         self.started_at: float | None = None
+        self._hwnd_mode = not cfg.window.is_desktop
+        self._restore: WindowRestore | None = None
+        self._grab_stop = threading.Event()
+        self._grab_thread: threading.Thread | None = None
+        self._frame_w = 0
+        self._frame_h = 0
 
     def start(self) -> None:
         if not self.hw.has_libvvenc:
             raise RecorderError(self.hw.vvenc_skip_reason or "libvvenc is not available")
-        desktop_ok = self.cfg.window.is_desktop and self.hw.has_ddagrab
-        if not self.hw.has_gdigrab and not desktop_ok:
-            raise RecorderError(self.hw.capture_skip_reason or "gdigrab is not available")
+        if not self._hwnd_mode:
+            desktop_ok = self.hw.has_ddagrab or self.hw.has_gdigrab
+            if not desktop_ok:
+                raise RecorderError(self.hw.capture_skip_reason or "no desktop grabber")
 
         self.cfg.output.parent.mkdir(parents=True, exist_ok=True)
         for p in (self.video_tmp, self.audio_tmp, self.cfg.output):
             if p.exists():
                 p.unlink()
 
-        cmd = build_video_cmd(self.cfg, self.hw, self.video_tmp)
+        fps = max(1, min(120, int(self.cfg.fps)))
+        flags = CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+        if self._hwnd_mode:
+            self._restore = prepare_for_capture(self.cfg.window)
+            geo = refresh_geometry(self.cfg.window)
+            self._frame_w, self._frame_h = geo.even_size
+            if self._restore.was_minimized:
+                self.on_log(
+                    f"Restored minimized window hwnd={self.cfg.window.hwnd} "
+                    f"to {self._frame_w}x{self._frame_h} (will minimize again on stop)"
+                )
+            cmd = build_hwnd_cmd(
+                self.hw, self._frame_w, self._frame_h, fps, self.cfg.qp, self.video_tmp
+            )
+        else:
+            cmd = build_video_cmd(self.cfg, self.hw, self.video_tmp)
+
         self.on_log("FFmpeg: " + " ".join(cmd))
 
-        # WASAPI first so the wav timeline covers the FFmpeg startup gap.
         self.audio = AudioRecorder(
             mode=self.cfg.audio_mode,
             wav_path=self.audio_tmp,
@@ -222,31 +253,65 @@ class CaptureSession:
         self.audio.start()
         self.on_log(f"Audio: {self.cfg.audio_mode} (WASAPI)")
 
-        flags = CREATE_NO_WINDOW if sys.platform == "win32" else 0
         self.proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+            bufsize=0,
             creationflags=flags,
         )
         self.started_at = time.time()
         self._err_thread = threading.Thread(target=self._drain_stderr, daemon=True)
         self._err_thread.start()
+        if self._hwnd_mode:
+            self._grab_thread = threading.Thread(
+                target=self._grab_loop, args=(fps,), daemon=True, name="hwnd-grab"
+            )
+            self._grab_thread.start()
+            self.on_log(
+                f"HWND grab {self.cfg.window.exe or self.cfg.window.title} "
+                f"hwnd={self.cfg.window.hwnd} {self._frame_w}x{self._frame_h} @ {fps} fps"
+            )
+
+    def _grab_loop(self, fps: int) -> None:
+        period = 1.0 / max(1, fps)
+        hwnd = self.cfg.window.hwnd
+        assert self.proc and self.proc.stdin
+        stdin = self.proc.stdin
+        next_t = time.perf_counter()
+        try:
+            while not self._grab_stop.is_set():
+                if self.proc.poll() is not None:
+                    break
+                frame = grab_hwnd_bgra(hwnd, self._frame_w, self._frame_h)
+                stdin.write(frame)
+                stdin.flush()
+                next_t += period
+                delay = next_t - time.perf_counter()
+                if delay > 0:
+                    self._grab_stop.wait(delay)
+                else:
+                    next_t = time.perf_counter()
+        except (BrokenPipeError, OSError) as exc:
+            self.on_log(f"HWND grab stopped: {exc}")
+        except Exception as exc:
+            self.on_log(f"HWND grab error: {exc}")
+        finally:
+            try:
+                stdin.close()
+            except OSError:
+                pass
 
     def _drain_stderr(self) -> None:
         assert self.proc and self.proc.stderr
-        for line in self.proc.stderr:
-            text = line.rstrip()
+        for raw in self.proc.stderr:
+            text = raw.decode("utf-8", errors="replace").rstrip()
             if not text:
                 continue
             self._stderr.append(text)
             if len(self._stderr) > 200:
                 self._stderr = self._stderr[-100:]
-            # Keep the GUI noise down — stats lines only.
             if "time=" in text or "error" in text.lower() or "failed" in text.lower():
                 self.on_log(text)
 
@@ -256,11 +321,18 @@ class CaptureSession:
         return time.time() - self.started_at
 
     def stop(self) -> Path:
+        self._grab_stop.set()
+        if self._grab_thread:
+            self._grab_thread.join(timeout=5)
+
         if self.proc and self.proc.poll() is None:
             try:
-                if self.proc.stdin:
-                    self.proc.stdin.write("q")
-                    self.proc.stdin.flush()
+                if self.proc.stdin and not self.proc.stdin.closed:
+                    if self._hwnd_mode:
+                        self.proc.stdin.close()
+                    else:
+                        self.proc.stdin.write(b"q")
+                        self.proc.stdin.flush()
             except (BrokenPipeError, OSError):
                 pass
             try:
@@ -268,6 +340,13 @@ class CaptureSession:
             except subprocess.TimeoutExpired:
                 self.proc.kill()
                 self.proc.wait(timeout=5)
+
+        if self._restore is not None:
+            try:
+                self._restore.revert()
+            except Exception as exc:
+                self.on_log(f"Could not restore window state: {exc}")
+            self._restore = None
 
         audio_err: str | None = None
         if self.audio:

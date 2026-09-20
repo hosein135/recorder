@@ -6,6 +6,7 @@ from __future__ import annotations
 import sys
 import threading
 import traceback
+from datetime import datetime
 from pathlib import Path
 
 _SCRIPTS = Path(__file__).resolve().parent
@@ -30,6 +31,7 @@ from tkinter import filedialog, messagebox, ttk
 from audio import AudioDevice, default_loopback, default_microphone, list_loopbacks, list_microphones
 from capture import CaptureSession, RecordConfig, RecorderError, default_output_path
 from hw_detect import HardwareProfile, detect, format_involvement_report
+from player import find_mpc_hc, format_size, list_recordings, play_with_mpc
 from windows import WindowInfo, list_windows
 
 BG = "#1b1d23"
@@ -51,11 +53,13 @@ class RecorderApp(tk.Tk):
 
         self.hw: HardwareProfile | None = None
         self.windows: list[WindowInfo] = []
+        self._by_id: dict[str, WindowInfo] = {}
         self.mics: list[AudioDevice] = []
         self.loopbacks: list[AudioDevice] = []
         self.session: CaptureSession | None = None
         self._tick_job: str | None = None
         self.output_dir = _ROOT / "recordings"
+        self._rec_by_id: dict[str, Path] = {}
 
         self._style()
         self._build()
@@ -83,6 +87,9 @@ class RecorderApp(tk.Tk):
         style.configure("TSpinbox", fieldbackground=PANEL, background=PANEL, foreground=FG)
         style.configure("TLabelframe", background=BG, foreground=FG)
         style.configure("TLabelframe.Label", background=BG, foreground=MUTED)
+        style.configure("TNotebook", background=BG, borderwidth=0)
+        style.configure("TNotebook.Tab", background=PANEL, foreground=MUTED, padding=(16, 6), font=("Segoe UI", 10))
+        style.map("TNotebook.Tab", background=[("selected", ACCENT)], foreground=[("selected", "#fff")])
 
     def _build(self) -> None:
         pad = {"padx": 14, "pady": 8}
@@ -94,7 +101,15 @@ class RecorderApp(tk.Tk):
             side="left", padx=(12, 0)
         )
 
-        body = ttk.Frame(self)
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(fill="both", expand=True, padx=14, pady=(0, 4))
+        record_tab = ttk.Frame(self.nb)
+        recs_tab = ttk.Frame(self.nb)
+        self.nb.add(record_tab, text="  Record  ")
+        self.nb.add(recs_tab, text="  Recordings  ")
+        self.nb.bind("<<NotebookTabChanged>>", self._on_tab)
+
+        body = ttk.Frame(record_tab)
         body.pack(fill="both", expand=True, padx=14)
 
         left = ttk.LabelFrame(body, text="Open windows")
@@ -103,23 +118,41 @@ class RecorderApp(tk.Tk):
         btns = ttk.Frame(left)
         btns.pack(fill="x", padx=8, pady=(8, 4))
         ttk.Button(btns, text="Refresh", command=self.refresh_windows).pack(side="left")
-
-        self.win_list = tk.Listbox(
+        ttk.Label(btns, text="Filter").pack(side="left", padx=(12, 4))
+        self.filter_var = tk.StringVar()
+        self.filter_var.trace_add("write", lambda *_: self._apply_filter())
+        filt = ttk.Entry(btns, textvariable=self.filter_var, width=22)
+        filt.pack(side="left", fill="x", expand=True)
+        ttk.Label(
             left,
-            bg=PANEL,
-            fg=FG,
-            selectbackground=ACCENT,
-            selectforeground="#fff",
-            relief="flat",
-            highlightthickness=1,
-            highlightbackground=BORDER,
-            font=("Segoe UI", 10),
-            activestyle="none",
-        )
+            text="Includes minimized Chrome/Edge. Type chrome to find it.",
+            style="Muted.TLabel",
+        ).pack(anchor="w", padx=8)
+
+        cols = ("title", "app", "size", "state")
+        self.win_list = ttk.Treeview(left, columns=cols, show="headings", selectmode="browse", height=14)
+        self.win_list.heading("title", text="Window")
+        self.win_list.heading("app", text="App")
+        self.win_list.heading("size", text="Size")
+        self.win_list.heading("state", text="State")
+        self.win_list.column("title", width=280, anchor="w")
+        self.win_list.column("app", width=110, anchor="w")
+        self.win_list.column("size", width=90, anchor="center")
+        self.win_list.column("state", width=90, anchor="w")
         scroll = ttk.Scrollbar(left, command=self.win_list.yview)
         self.win_list.configure(yscrollcommand=scroll.set)
         self.win_list.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=(0, 8))
         scroll.pack(side="right", fill="y", pady=(0, 8), padx=(0, 8))
+        style = ttk.Style(self)
+        style.configure(
+            "Treeview",
+            background=PANEL,
+            foreground=FG,
+            fieldbackground=PANEL,
+            rowheight=22,
+        )
+        style.configure("Treeview.Heading", background=BG, foreground=MUTED)
+        style.map("Treeview", background=[("selected", ACCENT)], foreground=[("selected", "#fff")])
 
         right = ttk.Frame(body)
         right.pack(side="right", fill="y")
@@ -184,6 +217,36 @@ class RecorderApp(tk.Tk):
         self.time_label = ttk.Label(actions, text="00:00:00", style="Title.TLabel")
         self.time_label.pack(side="left", padx=16)
 
+        rec_bar = ttk.Frame(recs_tab)
+        rec_bar.pack(fill="x", padx=8, pady=8)
+        ttk.Button(rec_bar, text="Refresh", command=lambda: self.refresh_recordings(log=True)).pack(side="left")
+        ttk.Label(
+            rec_bar,
+            text="Click a recording to play it in Media Player Classic (MPC-HC).",
+            style="Muted.TLabel",
+        ).pack(side="left", padx=12)
+        self.mpc_status = ttk.Label(rec_bar, text="", style="Muted.TLabel")
+        self.mpc_status.pack(side="right")
+
+        rec_cols = ("name", "size", "modified")
+        rec_wrap = ttk.Frame(recs_tab)
+        rec_wrap.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.rec_list = ttk.Treeview(
+            rec_wrap, columns=rec_cols, show="headings", selectmode="browse", height=16
+        )
+        self.rec_list.heading("name", text="File")
+        self.rec_list.heading("size", text="Size")
+        self.rec_list.heading("modified", text="Modified")
+        self.rec_list.column("name", width=420, anchor="w")
+        self.rec_list.column("size", width=90, anchor="e")
+        self.rec_list.column("modified", width=160, anchor="w")
+        rec_scroll = ttk.Scrollbar(rec_wrap, command=self.rec_list.yview)
+        self.rec_list.configure(yscrollcommand=rec_scroll.set)
+        self.rec_list.pack(side="left", fill="both", expand=True)
+        rec_scroll.pack(side="right", fill="y")
+        self.rec_list.bind("<ButtonRelease-1>", self._on_recording_click)
+        self.rec_list.bind("<Return>", self._on_recording_enter)
+
         self.hw_box = tk.Text(
             self,
             height=7,
@@ -229,6 +292,14 @@ class RecorderApp(tk.Tk):
                 self._log("ERROR: " + (self.hw.vvenc_skip_reason or "libvvenc missing"))
         self.refresh_windows()
         self.refresh_audio()
+        self.refresh_recordings(log=True)
+        mpc = find_mpc_hc()
+        if mpc:
+            self._log(f"MPC-HC: {mpc}")
+            self.mpc_status.configure(text=mpc.name)
+        else:
+            self._log("MPC-HC not found. Re-run run.cmd to install clsid2.mpc-hc 2.8.2.")
+            self.mpc_status.configure(text="MPC-HC missing")
 
     def _set_hw(self, text: str) -> None:
         self.hw_box.configure(state="normal")
@@ -249,16 +320,62 @@ class RecorderApp(tk.Tk):
             self.after(0, _append)
 
     def refresh_windows(self) -> None:
+        keep_hwnd = None
+        sel = self.win_list.selection()
+        if sel and sel[0] in self._by_id:
+            keep_hwnd = self._by_id[sel[0]].hwnd
         try:
             self.windows = list_windows()
         except Exception as exc:
             self._log(f"Window list failed: {exc}")
             return
-        self.win_list.delete(0, "end")
+        self._apply_filter(prefer_hwnd=keep_hwnd)
+        chrome = [w for w in self.windows if w.exe.lower() in ("chrome.exe", "msedge.exe")]
+        self._log(
+            f"Found {len(self.windows) - 1} windows"
+            + (f", including {len(chrome)} Chrome/Edge" if chrome else ", no Chrome/Edge yet")
+        )
+
+    def _apply_filter(self, prefer_hwnd: int | None = None) -> None:
+        if prefer_hwnd is None:
+            sel = self.win_list.selection()
+            if sel and sel[0] in self._by_id:
+                prefer_hwnd = self._by_id[sel[0]].hwnd
+        needle = (self.filter_var.get() if hasattr(self, "filter_var") else "").strip().lower()
+        children = self.win_list.get_children()
+        if children:
+            self.win_list.delete(*children)
+        self._by_id = {}
+        first_id = None
+        prefer_id = None
         for w in self.windows:
-            self.win_list.insert("end", w.label())
-        if self.windows:
-            self.win_list.selection_set(0)
+            if needle and needle not in w.search_blob():
+                continue
+            iid = "desktop" if w.is_desktop else f"hwnd-{w.hwnd}"
+            title = w.title.replace("\n", " ").strip() or "(untitled)"
+            if len(title) > 90:
+                title = title[:87] + "..."
+            self.win_list.insert(
+                "",
+                "end",
+                iid=iid,
+                values=(title, w.exe or ("screen" if w.is_desktop else ""), f"{w.width}x{w.height}", w.state_text()),
+            )
+            self._by_id[iid] = w
+            if first_id is None:
+                first_id = iid
+            if prefer_hwnd is not None and w.hwnd == prefer_hwnd:
+                prefer_id = iid
+        pick = prefer_id or first_id
+        if pick:
+            self.win_list.selection_set(pick)
+            self.win_list.see(pick)
+
+    def _selected_window(self) -> WindowInfo | None:
+        sel = self.win_list.selection()
+        if not sel:
+            return None
+        return self._by_id.get(sel[0])
 
     def refresh_audio(self) -> None:
         try:
@@ -293,15 +410,7 @@ class RecorderApp(tk.Tk):
         chosen = filedialog.askdirectory(initialdir=self.dir_var.get() or str(self.output_dir))
         if chosen:
             self.dir_var.set(chosen)
-
-    def _selected_window(self) -> WindowInfo | None:
-        sel = self.win_list.curselection()
-        if not sel:
-            return None
-        idx = int(sel[0])
-        if 0 <= idx < len(self.windows):
-            return self.windows[idx]
-        return None
+            self.refresh_recordings()
 
     def _device_by_label(self, items: list[AudioDevice], label: str) -> AudioDevice | None:
         for item in items:
@@ -370,7 +479,10 @@ class RecorderApp(tk.Tk):
             messagebox.showerror("Record failed", str(exc))
             return
         self.record_btn.configure(text="■  Stop")
-        self.win_list.configure(state="disabled")
+        try:
+            self.win_list.configure(selectmode="none")
+        except tk.TclError:
+            pass
         self._tick()
         self._log(f"Recording {window.label()} @ {fps} fps → {cfg.output.name}")
 
@@ -403,11 +515,66 @@ class RecorderApp(tk.Tk):
             self._tick_job = None
         self.session = None
         self.record_btn.configure(text="●  Record", state="normal")
-        self.win_list.configure(state="normal")
+        try:
+            self.win_list.configure(selectmode="browse")
+        except tk.TclError:
+            pass
         if err:
             messagebox.showerror("Recording finished with errors", err)
         elif path:
             messagebox.showinfo("Saved", f"Wrote:\n{path}")
+        self.refresh_recordings(log=True)
+
+    def _on_tab(self, _event: object | None = None) -> None:
+        try:
+            current = self.nb.index(self.nb.select())
+        except tk.TclError:
+            return
+        if current == 1:
+            self.refresh_recordings()
+
+    def refresh_recordings(self, log: bool = False) -> None:
+        folder = Path(self.dir_var.get().strip() or self.output_dir)
+        files = list_recordings(folder)
+        children = self.rec_list.get_children()
+        if children:
+            self.rec_list.delete(*children)
+        self._rec_by_id = {}
+        for i, path in enumerate(files):
+            iid = f"rec-{i}"
+            try:
+                st = path.stat()
+                size = format_size(st.st_size)
+                modified = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+            except OSError:
+                size, modified = "?", ""
+            self.rec_list.insert("", "end", iid=iid, values=(path.name, size, modified))
+            self._rec_by_id[iid] = path
+        if log:
+            self._log(f"Recordings: {len(files)} file(s) in {folder}")
+
+    def _on_recording_click(self, event: tk.Event) -> None:
+        row = self.rec_list.identify_row(event.y)
+        region = self.rec_list.identify_region(event.x, event.y)
+        if not row or region not in ("cell", "tree"):
+            return
+        self.rec_list.selection_set(row)
+        self._play_recording(row)
+
+    def _on_recording_enter(self, _event: tk.Event) -> None:
+        sel = self.rec_list.selection()
+        if sel:
+            self._play_recording(sel[0])
+
+    def _play_recording(self, iid: str) -> None:
+        path = self._rec_by_id.get(iid)
+        if path is None:
+            return
+        try:
+            play_with_mpc(path)
+            self._log(f"Playing in MPC-HC: {path.name}")
+        except Exception as exc:
+            messagebox.showerror("Playback", str(exc))
 
     def _on_close(self) -> None:
         if self.session:

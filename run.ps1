@@ -11,6 +11,7 @@ Write-Host "Working directory set to: $PSScriptRoot" -ForegroundColor Cyan
 
 $pythonTargetVersion = "3.12.8"
 $ffmpegTargetVersion = "8.0"
+$mpcTargetVersion = "2.8.2"
 $vfoxVersion = "0.6.2"
 $vfoxPackageId = "version-fox.vfox"
 
@@ -34,11 +35,27 @@ function Refresh-SessionPath {
                 [System.Environment]::GetEnvironmentVariable("Path", "User")
 
     if ($WingetPackagesRoot -and (Test-Path $WingetPackagesRoot)) {
-        foreach ($exeName in @("vfox.exe", "ffmpeg.exe")) {
+        foreach ($exeName in @("vfox.exe", "ffmpeg.exe", "mpc-hc64.exe", "mpc-hc.exe")) {
             $exe = Get-ChildItem -Path $WingetPackagesRoot -Recurse -Filter $exeName -ErrorAction SilentlyContinue |
                 Select-Object -First 1
             if ($exe -and ($env:Path -notlike "*$($exe.DirectoryName)*")) {
                 $env:Path = "$($exe.DirectoryName);$env:Path"
+            }
+        }
+    }
+
+    foreach ($root in @(
+        "${env:ProgramFiles}\MPC-HC",
+        "${env:ProgramFiles(x86)}\MPC-HC",
+        "$env:LOCALAPPDATA\Programs\MPC-HC"
+    )) {
+        if (-not (Test-Path $root)) { continue }
+        foreach ($exeName in @("mpc-hc64.exe", "mpc-hc.exe")) {
+            $exe = Get-ChildItem -Path $root -Recurse -Filter $exeName -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+            if ($exe -and ($env:Path -notlike "*$($exe.DirectoryName)*")) {
+                $env:Path = "$($exe.DirectoryName);$env:Path"
+                break
             }
         }
     }
@@ -376,6 +393,27 @@ function Ensure-WingetPackage {
     Write-Host "$Name is ready." -ForegroundColor Green
 }
 
+function Find-MpcHc {
+    foreach ($name in @("mpc-hc64", "mpc-hc")) {
+        $cmd = Get-Command $name -ErrorAction SilentlyContinue
+        if ($cmd -and $cmd.Source) { return $cmd.Source }
+    }
+    foreach ($root in @(
+        "${env:ProgramFiles}\MPC-HC",
+        "${env:ProgramFiles(x86)}\MPC-HC",
+        "$env:LOCALAPPDATA\Programs\MPC-HC",
+        "$env:LOCALAPPDATA\Microsoft\WinGet\Packages"
+    )) {
+        if (-not (Test-Path $root)) { continue }
+        foreach ($exeName in @("mpc-hc64.exe", "mpc-hc.exe")) {
+            $exe = Get-ChildItem -Path $root -Recurse -Filter $exeName -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+            if ($exe) { return $exe.FullName }
+        }
+    }
+    return $null
+}
+
 ## 1. INSTALL WINGET
 Write-Section "Bootstrap: WinGet"
 if (!(Get-Command winget -ErrorAction SilentlyContinue)) {
@@ -465,6 +503,31 @@ if ($encoders -notmatch 'libvvenc') {
     throw "This FFmpeg build has no libvvenc (H.266). Install Gyan.FFmpeg full, not Essentials."
 }
 Write-Host "  libvvenc is present." -ForegroundColor Green
+
+## 5b. MPC-HC (Media Player Classic) 2.8.2
+Write-Section "Bootstrap: MPC-HC $mpcTargetVersion"
+Refresh-SessionPath -WingetPackagesRoot $wingetPackagesRoot
+$mpcExe = Find-MpcHc
+if ($mpcExe) {
+    Write-Host "MPC-HC is already installed: $mpcExe" -ForegroundColor Green
+} else {
+    Write-Host "Installing MPC-HC version $mpcTargetVersion via winget (clsid2.mpc-hc)..." -ForegroundColor Yellow
+    Write-Host "  (winget shows its own progress bar)" -ForegroundColor DarkGray
+    winget install --id "clsid2.mpc-hc" --version $mpcTargetVersion --exact --accept-source-agreements --accept-package-agreements
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "MPC-HC $mpcTargetVersion unavailable; trying latest clsid2.mpc-hc..." -ForegroundColor Yellow
+        winget install --id "clsid2.mpc-hc" --exact --accept-source-agreements --accept-package-agreements
+    }
+    Refresh-SessionPath -WingetPackagesRoot $wingetPackagesRoot
+    $mpcExe = Find-MpcHc
+    if (-not $mpcExe) {
+        throw "MPC-HC installed but mpc-hc64.exe was not found. Open a new admin PowerShell and re-run."
+    }
+    Write-Host "MPC-HC is ready: $mpcExe" -ForegroundColor Green
+}
+$mpcDir = Split-Path $mpcExe -Parent
+if ($env:Path -notlike "*$mpcDir*") { $env:Path = "$mpcDir;$env:Path" }
+Add-VfoxSdkToMachinePath -ExeName "mpc-hc64.exe" | Out-Null
 
 ## 6. PYTHON PACKAGES
 Write-Section "Python packages (pinned)"
