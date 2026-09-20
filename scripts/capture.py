@@ -28,6 +28,10 @@ DEFAULT_SAMPLE_RATE = 48000
 MIN_USEFUL_SAMPLE_RATE = 16000
 SAMPLE_RATE_MIN = 8000
 SAMPLE_RATE_MAX = 48000
+DEFAULT_SAMPLE_KHZ = DEFAULT_SAMPLE_RATE // 1000
+MIN_USEFUL_SAMPLE_KHZ = MIN_USEFUL_SAMPLE_RATE // 1000
+SAMPLE_KHZ_MIN = SAMPLE_RATE_MIN // 1000
+SAMPLE_KHZ_MAX = SAMPLE_RATE_MAX // 1000
 OPUS_SAMPLE_RATES = (8000, 12000, 16000, 24000, 48000)
 
 DEFAULT_VIDEO_KBPS = 1500
@@ -60,6 +64,10 @@ def clamp_audio_kbps(n: int) -> int:
 
 def clamp_sample_rate(n: int) -> int:
     return max(SAMPLE_RATE_MIN, min(SAMPLE_RATE_MAX, int(n)))
+
+
+def sample_khz_to_hz(khz: int) -> int:
+    return clamp_sample_rate(int(khz) * 1000)
 
 
 def snap_opus_rate(n: int) -> int:

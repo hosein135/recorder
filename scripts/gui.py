@@ -38,17 +38,17 @@ from capture import (
     AUDIO_KBPS_MIN,
     CaptureSession,
     DEFAULT_AUDIO_KBPS,
-    DEFAULT_SAMPLE_RATE,
+    DEFAULT_SAMPLE_KHZ,
     DEFAULT_TOTAL_KBPS,
     DEFAULT_VIDEO_KBPS,
     MIN_USEFUL_AUDIO_KBPS,
-    MIN_USEFUL_SAMPLE_RATE,
+    MIN_USEFUL_SAMPLE_KHZ,
     MIN_USEFUL_TOTAL_KBPS,
     MIN_USEFUL_VIDEO_KBPS,
     RecordConfig,
     RecorderError,
-    SAMPLE_RATE_MAX,
-    SAMPLE_RATE_MIN,
+    SAMPLE_KHZ_MAX,
+    SAMPLE_KHZ_MIN,
     TOTAL_KBPS_MAX,
     TOTAL_KBPS_MIN,
     VIDEO_KBPS_MAX,
@@ -57,10 +57,11 @@ from capture import (
     clamp_sample_rate,
     clamp_video_kbps,
     default_output_path,
+    sample_khz_to_hz,
     snap_opus_rate,
 )
 from hwnd_grab import grab_thumb_ppm
-from hw_detect import HardwareProfile, detect, format_involvement_report
+from hw_detect import HardwareProfile, detect
 from player import find_mpc_hc, format_size, list_recordings, play_with_mpc
 from windows import WindowInfo, cursor_pos, escape_pressed, left_button_down, list_windows, window_at_point
 
@@ -76,7 +77,8 @@ RECORD_DIM = "#8f2d32"
 OK = "#3dd68c"
 BORDER = "#343b4a"
 WARN = "#f0c14b"
-SIDE_W = 340
+CHIP_BG = "#171b24"
+CHIP_WARN_BG = "#3a3218"
 
 
 class RecorderApp(tk.Tk):
@@ -97,10 +99,101 @@ class RecorderApp(tk.Tk):
         self.output_dir = _ROOT / "recordings"
         self._rec_by_id: dict[str, Path] = {}
         self._syncing_rates = False
+        self._min_labels: dict[str, tk.Label] = {}
+        self._min_floors: dict[str, int] = {}
 
         self._style()
         self._build()
+        self.after_idle(self._maximize)
         self.after(50, self._boot)
+
+    def _maximize(self) -> None:
+        self.update_idletasks()
+        try:
+            self.state("zoomed")
+            return
+        except tk.TclError:
+            pass
+        try:
+            self.attributes("-zoomed", True)
+            return
+        except tk.TclError:
+            pass
+        if sys.platform == "win32":
+            try:
+                import ctypes
+
+                user32 = ctypes.windll.user32
+                hwnd = user32.GetParent(self.winfo_id())
+                if not hwnd:
+                    hwnd = int(self.winfo_id())
+                user32.ShowWindow(int(hwnd), 3)
+                return
+            except Exception:
+                pass
+        w = self.winfo_screenwidth()
+        h = self.winfo_screenheight()
+        self.geometry(f"{w}x{h}+0+0")
+
+    def _card(self, parent: tk.Misc, title: str) -> tk.Frame:
+        outer = tk.Frame(parent, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
+        outer.pack(fill="x", pady=(0, 14))
+        body = tk.Frame(outer, bg=PANEL)
+        body.pack(fill="x", padx=16, pady=14)
+        ttk.Label(body, text=title.upper(), style="Section.TLabel").pack(anchor="w", pady=(0, 10))
+        return body
+
+    def _add_setting_row(
+        self,
+        grid: tk.Misc,
+        row: int,
+        title: str,
+        var: tk.StringVar,
+        lo: int,
+        hi: int,
+        step: int,
+        min_ok: int,
+        key: str,
+        unit: str,
+    ) -> None:
+        rowf = tk.Frame(grid, bg=PANEL2, highlightthickness=0)
+        rowf.grid(row=row, column=0, sticky="ew", pady=3)
+        tk.Label(
+            rowf,
+            text=title,
+            bg=PANEL2,
+            fg=MUTED,
+            font=("Segoe UI", 9),
+            width=12,
+            anchor="w",
+        ).pack(side="left", padx=(10, 4), pady=8)
+        ttk.Spinbox(rowf, textvariable=var, from_=lo, to=hi, increment=step, width=8).pack(side="left")
+        tk.Label(rowf, text=unit, bg=PANEL2, fg=MUTED, font=("Segoe UI", 8), anchor="w").pack(
+            side="left", padx=(6, 8)
+        )
+        tk.Frame(rowf, bg=PANEL2).pack(side="left", fill="x", expand=True)
+        chip = tk.Label(
+            rowf,
+            text=f"min {min_ok} {unit}",
+            bg=CHIP_BG,
+            fg=MUTED,
+            font=("Segoe UI", 8),
+            padx=8,
+            pady=2,
+        )
+        chip.pack(side="right", padx=(0, 10), pady=8)
+        range_chip = tk.Label(
+            rowf,
+            text=f"range {lo}–{hi} {unit}",
+            bg=CHIP_BG,
+            fg=MUTED,
+            font=("Segoe UI", 8),
+            padx=8,
+            pady=2,
+        )
+        range_chip.pack(side="right", padx=(0, 8), pady=8)
+        self._min_labels[key] = chip
+        self._min_floors[key] = min_ok
 
     def _style(self) -> None:
         style = ttk.Style(self)
@@ -116,13 +209,18 @@ class RecorderApp(tk.Tk):
         style.configure("Warn.TLabel", background=BG, foreground=WARN, font=("Segoe UI", 8))
         style.configure("Hint.TLabel", background=BG, foreground=MUTED, font=("Segoe UI", 8))
         style.configure("Panel.TLabel", background=PANEL, foreground=FG)
+        style.configure("Side.TFrame", background=PANEL)
+        style.configure("Section.TLabel", background=PANEL, foreground=MUTED, font=("Segoe UI Semibold", 8))
+        style.configure("Side.TLabel", background=PANEL, foreground=MUTED, font=("Segoe UI", 9))
+        style.configure("Side.TRadiobutton", background=PANEL2, foreground=FG, font=("Segoe UI", 10), padding=2)
+        style.map("Side.TRadiobutton", background=[("active", PANEL2)], foreground=[("selected", ACCENT)])
         style.configure("Title.TLabel", background=BG, foreground=FG, font=("Segoe UI Semibold", 18))
         style.configure("Timer.TLabel", background=BG, foreground=FG, font=("Cascadia Mono", 20, "bold"))
         style.configure("Badge.TLabel", background=PANEL2, foreground=MUTED, font=("Segoe UI", 8), padding=(8, 3))
         style.configure("Live.TLabel", background=RECORD, foreground="#fff", font=("Segoe UI Semibold", 8), padding=(8, 3))
         style.configure("Ready.TLabel", background=PANEL2, foreground=OK, font=("Segoe UI Semibold", 8), padding=(8, 3))
         style.configure("Paused.TLabel", background="#6b5420", foreground="#fff", font=("Segoe UI Semibold", 8), padding=(8, 3))
-        style.configure("Field.TLabel", background=BG, foreground=MUTED, font=("Segoe UI", 9), width=14)
+        style.configure("Field.TLabel", background=BG, foreground=MUTED, font=("Segoe UI", 9), width=12)
         style.configure("TRadiobutton", background=BG, foreground=FG, font=("Segoe UI", 10), padding=2)
         style.map("TRadiobutton", background=[("active", BG)], foreground=[("selected", ACCENT)])
         style.configure("TButton", font=("Segoe UI", 10), padding=(10, 6), background=PANEL2, foreground=FG)
@@ -145,20 +243,6 @@ class RecorderApp(tk.Tk):
         style.map("TSpinbox", fieldbackground=[("!disabled", PANEL)], foreground=[("!disabled", FG)])
         style.configure("TLabelframe", background=BG, foreground=FG, bordercolor=BORDER, relief="flat")
         style.configure("TLabelframe.Label", background=BG, foreground=MUTED, font=("Segoe UI Semibold", 9))
-        style.configure("TNotebook", background=BG, borderwidth=0, tabmargins=(0, 0, 0, 0))
-        style.configure(
-            "TNotebook.Tab",
-            background=PANEL2,
-            foreground=MUTED,
-            padding=(22, 9),
-            font=("Segoe UI Semibold", 10),
-            borderwidth=0,
-        )
-        style.map(
-            "TNotebook.Tab",
-            background=[("selected", ACCENT), ("active", ACCENT_DIM)],
-            foreground=[("selected", "#fff"), ("active", "#fff")],
-        )
         style.configure(
             "Treeview",
             background=PANEL,
@@ -191,15 +275,43 @@ class RecorderApp(tk.Tk):
         self.time_label = ttk.Label(header, text="00:00:00", style="Timer.TLabel")
         self.time_label.pack(side="right", padx=(0, 10))
 
-        self.nb = ttk.Notebook(self)
-        self.nb.pack(fill="both", expand=True, padx=18, pady=(0, 6))
-        self.record_tab = ttk.Frame(self.nb)
-        self.recs_tab = ttk.Frame(self.nb)
-        self.sys_tab = ttk.Frame(self.nb)
-        self.nb.add(self.record_tab, text="  Record  ")
-        self.nb.add(self.recs_tab, text="  Recordings  ")
-        self.nb.add(self.sys_tab, text="  System  ")
-        self.nb.bind("<<NotebookTabChanged>>", self._on_tab)
+        nav = tk.Frame(self, bg=BG)
+        nav.pack(fill="x", padx=18, pady=(4, 0))
+        self._tab_bar = tk.Frame(nav, bg=BG)
+        self._tab_bar.pack(side="left")
+        self._tab_labels: dict[str, tk.Label] = {}
+        self._tab_rules: dict[str, tk.Frame] = {}
+        for key, title in (("record", "Record"), ("recs", "Recordings"), ("settings", "Settings")):
+            cell = tk.Frame(self._tab_bar, bg=BG)
+            cell.pack(side="left", padx=(0, 22))
+            lbl = tk.Label(
+                cell,
+                text=title,
+                bg=BG,
+                fg=MUTED,
+                font=("Segoe UI Semibold", 13),
+                cursor="hand2",
+                padx=2,
+                pady=4,
+            )
+            lbl.pack()
+            rule = tk.Frame(cell, bg=BG, height=2)
+            rule.pack(fill="x")
+            lbl.bind("<Button-1>", lambda _e, k=key: self._show_page(k))
+            rule.bind("<Button-1>", lambda _e, k=key: self._show_page(k))
+            lbl.bind("<Enter>", lambda _e, k=key: self._tab_hover(k, True))
+            lbl.bind("<Leave>", lambda _e, k=key: self._tab_hover(k, False))
+            self._tab_labels[key] = lbl
+            self._tab_rules[key] = rule
+        tk.Frame(self, bg=BORDER, height=1).pack(fill="x", padx=18, pady=(0, 8))
+
+        self._page_host = ttk.Frame(self)
+        self._page_host.pack(fill="both", expand=True, padx=18, pady=(0, 6))
+        self.record_tab = ttk.Frame(self._page_host)
+        self.recs_tab = ttk.Frame(self._page_host)
+        self.settings_tab = ttk.Frame(self._page_host)
+        self._pages = {"record": self.record_tab, "recs": self.recs_tab, "settings": self.settings_tab}
+        self._current_page = "record"
 
         body = ttk.Frame(self.record_tab)
         body.pack(fill="both", expand=True, padx=12, pady=(10, 0))
@@ -250,157 +362,16 @@ class RecorderApp(tk.Tk):
         self.win_list.tag_configure("even", background=PANEL2)
         self.win_list.tag_configure("screen", foreground=ACCENT)
 
-        right = ttk.Frame(body, width=SIDE_W)
-        right.pack(side="right", fill="y", padx=(12, 0))
-        right.pack_propagate(False)
-
-        rec = ttk.LabelFrame(right, text="  Capture  ")
-        rec.pack(fill="x")
-
-        grid = ttk.Frame(rec)
-        grid.pack(fill="x", padx=12, pady=(12, 4))
-        for col, weight in ((0, 0), (1, 1), (2, 0)):
-            grid.columnconfigure(col, weight=weight)
-
-        ttk.Label(grid, text="FPS", style="Field.TLabel").grid(row=0, column=0, sticky="w", pady=4)
-        self.fps_var = tk.StringVar(value="30")
-        ttk.Spinbox(grid, textvariable=self.fps_var, from_=1, to=240, increment=1, width=7).grid(
-            row=0, column=1, sticky="w", padx=(0, 8), pady=4
-        )
-        ttk.Label(grid, text="1-240", style="Hint.TLabel").grid(row=0, column=2, sticky="w")
-
-        ttk.Label(grid, text="Audio kb/s", style="Field.TLabel").grid(row=1, column=0, sticky="w", pady=4)
-        self.audio_kbps_var = tk.StringVar(value=str(DEFAULT_AUDIO_KBPS))
-        ttk.Spinbox(
-            grid,
-            textvariable=self.audio_kbps_var,
-            from_=AUDIO_KBPS_MIN,
-            to=AUDIO_KBPS_MAX,
-            increment=8,
-            width=7,
-        ).grid(row=1, column=1, sticky="w", padx=(0, 8), pady=4)
-        ttk.Label(grid, text="Opus", style="Hint.TLabel").grid(row=1, column=2, sticky="w")
-
-        ttk.Label(grid, text="Sample rate", style="Field.TLabel").grid(row=2, column=0, sticky="w", pady=4)
-        self.sample_rate_var = tk.StringVar(value=str(DEFAULT_SAMPLE_RATE))
-        ttk.Spinbox(
-            grid,
-            textvariable=self.sample_rate_var,
-            from_=SAMPLE_RATE_MIN,
-            to=SAMPLE_RATE_MAX,
-            increment=1000,
-            width=7,
-        ).grid(row=2, column=1, sticky="w", padx=(0, 8), pady=4)
-        ttk.Label(grid, text="Hz", style="Hint.TLabel").grid(row=2, column=2, sticky="w")
-
-        ttk.Label(grid, text="Data rate", style="Field.TLabel").grid(row=3, column=0, sticky="w", pady=4)
-        self.video_kbps_var = tk.StringVar(value=str(DEFAULT_VIDEO_KBPS))
-        ttk.Spinbox(
-            grid,
-            textvariable=self.video_kbps_var,
-            from_=VIDEO_KBPS_MIN,
-            to=VIDEO_KBPS_MAX,
-            increment=100,
-            width=7,
-        ).grid(row=3, column=1, sticky="w", padx=(0, 8), pady=4)
-        ttk.Label(grid, text="video kb/s", style="Hint.TLabel").grid(row=3, column=2, sticky="w")
-
-        ttk.Label(grid, text="Total kb/s", style="Field.TLabel").grid(row=4, column=0, sticky="w", pady=4)
-        self.total_kbps_var = tk.StringVar(value=str(DEFAULT_TOTAL_KBPS))
-        ttk.Spinbox(
-            grid,
-            textvariable=self.total_kbps_var,
-            from_=TOTAL_KBPS_MIN,
-            to=TOTAL_KBPS_MAX,
-            increment=100,
-            width=7,
-        ).grid(row=4, column=1, sticky="w", padx=(0, 8), pady=4)
-        ttk.Label(grid, text="A+V", style="Hint.TLabel").grid(row=4, column=2, sticky="w")
-
-        self.audio_hint = ttk.Label(
-            rec,
-            text=f"Stay at {DEFAULT_AUDIO_KBPS} kb/s or above {MIN_USEFUL_AUDIO_KBPS} so speech stays usable.",
-            style="Hint.TLabel",
-            wraplength=SIDE_W - 36,
-        )
-        self.audio_hint.pack(anchor="w", padx=12, pady=(2, 0))
-        self.sample_hint = ttk.Label(
-            rec,
-            text=f"{DEFAULT_SAMPLE_RATE} Hz is a good default. Avoid going below {MIN_USEFUL_SAMPLE_RATE} Hz - speech gets muffled.",
-            style="Hint.TLabel",
-            wraplength=SIDE_W - 36,
-        )
-        self.sample_hint.pack(anchor="w", padx=12, pady=(0, 0))
-        self.video_hint = ttk.Label(
-            rec,
-            text=f"{DEFAULT_VIDEO_KBPS} kb/s is a smaller-file default. Avoid going below {MIN_USEFUL_VIDEO_KBPS} kb/s - on-screen text gets hard to read.",
-            style="Hint.TLabel",
-            wraplength=SIDE_W - 36,
-        )
-        self.video_hint.pack(anchor="w", padx=12, pady=(0, 0))
-        self.total_hint = ttk.Label(
-            rec,
-            text=f"Total is video + audio. Avoid going below {MIN_USEFUL_TOTAL_KBPS} kb/s.",
-            style="Hint.TLabel",
-            wraplength=SIDE_W - 36,
-        )
-        self.total_hint.pack(anchor="w", padx=12, pady=(0, 6))
-        self._syncing_rates = False
-        self.audio_kbps_var.trace_add("write", lambda *_: self._on_audio_or_video_rate())
-        self.sample_rate_var.trace_add("write", lambda *_: self._refresh_quality_hints())
-        self.video_kbps_var.trace_add("write", lambda *_: self._on_audio_or_video_rate())
-        self.total_kbps_var.trace_add("write", lambda *_: self._on_total_rate())
-
-        ttk.Label(rec, text="Sound source", style="Muted.TLabel").pack(anchor="w", padx=12, pady=(6, 2))
-        self.audio_var = tk.StringVar(value="both")
-        audio_row = ttk.Frame(rec)
-        audio_row.pack(fill="x", padx=10, pady=(0, 6))
-        for value, label in (("internal", "Internal"), ("external", "Mic"), ("both", "Both")):
-            ttk.Radiobutton(
-                audio_row,
-                text=label,
-                value=value,
-                variable=self.audio_var,
-                command=self._audio_changed,
-            ).pack(side="left", padx=6)
-
-        mic_row = ttk.Frame(rec)
-        mic_row.pack(fill="x", padx=12, pady=(4, 4))
-        ttk.Label(mic_row, text="Mic", style="Field.TLabel").pack(side="left")
-        self.mic_var = tk.StringVar()
-        self.mic_combo = ttk.Combobox(mic_row, textvariable=self.mic_var, state="readonly", width=22)
-        self.mic_combo.pack(side="left", fill="x", expand=True)
-
-        lb_row = ttk.Frame(rec)
-        lb_row.pack(fill="x", padx=12, pady=(0, 12))
-        ttk.Label(lb_row, text="Loopback", style="Field.TLabel").pack(side="left")
-        self.loop_var = tk.StringVar()
-        self.loop_combo = ttk.Combobox(lb_row, textvariable=self.loop_var, state="readonly", width=22)
-        self.loop_combo.pack(side="left", fill="x", expand=True)
-
-        out = ttk.LabelFrame(right, text="  Save to  ")
-        out.pack(fill="x", pady=(10, 0))
-        path_row = ttk.Frame(out)
-        path_row.pack(fill="x", padx=12, pady=10)
-        self.dir_var = tk.StringVar(value=str(self.output_dir))
-        ttk.Entry(path_row, textvariable=self.dir_var).pack(side="left", fill="x", expand=True)
-        ttk.Button(path_row, text="Browse", style="Ghost.TButton", command=self._browse).pack(
-            side="left", padx=(6, 0)
-        )
-
-        actions = ttk.Frame(right)
-        actions.pack(fill="x", pady=(14, 0))
+        actions = tk.Frame(self.record_tab, bg=BG)
+        actions.pack(fill="x", padx=12, pady=(8, 0))
         self.record_btn = ttk.Button(
             actions, text="●   Record    F9", style="Record.TButton", command=self.toggle_record
         )
-        self.record_btn.pack(fill="x")
-        pause_row = ttk.Frame(actions)
-        pause_row.pack(fill="x", pady=(8, 0))
-        self.pause_btn = ttk.Button(pause_row, text="Pause", command=self.toggle_pause, state="disabled")
-        self.pause_btn.pack(side="left", fill="x", expand=True)
-        ttk.Label(pause_row, text="Window is not hidden or moved", style="Hint.TLabel").pack(
-            side="left", padx=(8, 0)
-        )
+        self.record_btn.pack(side="left", fill="x", expand=True)
+        self.pause_btn = ttk.Button(actions, text="Pause", command=self.toggle_pause, state="disabled")
+        self.pause_btn.pack(side="left", padx=(8, 0), ipadx=18)
+
+        self._build_settings_page()
 
         log_frame = ttk.LabelFrame(self.record_tab, text="  Activity  ")
         log_frame.pack(fill="x", padx=12, pady=(8, 10))
@@ -463,20 +434,6 @@ class RecorderApp(tk.Tk):
         self.rec_list.tag_configure("even", background=PANEL2)
         self.rec_list.tag_configure("fresh", foreground=OK)
 
-        self.hw_box = tk.Text(
-            self.sys_tab,
-            bg=PANEL,
-            fg=MUTED,
-            relief="flat",
-            highlightthickness=0,
-            font=("Cascadia Mono", 9),
-            wrap="word",
-            padx=12,
-            pady=12,
-        )
-        self.hw_box.pack(fill="both", expand=True, padx=12, pady=12)
-        self.hw_box.configure(state="disabled")
-
         status = ttk.Frame(self)
         status.pack(fill="x", padx=18, pady=(0, 10))
         self.status_var = tk.StringVar(value="Ready")
@@ -484,6 +441,163 @@ class RecorderApp(tk.Tk):
 
         self.bind("<F9>", lambda _e: self.toggle_record())
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._show_page("record")
+
+    def _build_settings_page(self) -> None:
+        host = tk.Frame(self.settings_tab, bg=BG)
+        host.pack(fill="both", expand=True, padx=12, pady=(10, 10))
+        canvas = tk.Canvas(host, bg=BG, highlightthickness=0, bd=0)
+        scroll = ttk.Scrollbar(host, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas)
+        inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _stretch(event: tk.Event) -> None:
+            canvas.itemconfigure(win, width=event.width)
+
+        canvas.bind("<Configure>", _stretch)
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+        ttk.Label(
+            inner,
+            text="These apply the next time you press Record. F9 still starts and stops from any tab.",
+            style="Muted.TLabel",
+        ).pack(anchor="w", padx=2, pady=(0, 12))
+
+        cols = tk.Frame(inner, bg=BG)
+        cols.pack(fill="x")
+        left = tk.Frame(cols, bg=BG)
+        left.pack(side="left", fill="both", expand=True, padx=(0, 8))
+        right = tk.Frame(cols, bg=BG)
+        right.pack(side="left", fill="both", expand=True, padx=(8, 0))
+
+        capture = self._card(left, "Capture")
+        grid = tk.Frame(capture, bg=PANEL)
+        grid.pack(fill="x")
+        grid.columnconfigure(0, weight=1)
+
+        self.fps_var = tk.StringVar(value="30")
+        self.audio_kbps_var = tk.StringVar(value=str(DEFAULT_AUDIO_KBPS))
+        self.sample_rate_var = tk.StringVar(value=str(DEFAULT_SAMPLE_KHZ))
+        self.video_kbps_var = tk.StringVar(value=str(DEFAULT_VIDEO_KBPS))
+        self.total_kbps_var = tk.StringVar(value=str(DEFAULT_TOTAL_KBPS))
+
+        self._add_setting_row(grid, 0, "FPS", self.fps_var, 1, 240, 1, 1, "fps", "fps")
+        self._add_setting_row(
+            grid, 1, "Data rate", self.video_kbps_var, VIDEO_KBPS_MIN, VIDEO_KBPS_MAX, 100, MIN_USEFUL_VIDEO_KBPS, "video", "kb/s"
+        )
+        self._add_setting_row(
+            grid, 2, "Total", self.total_kbps_var, TOTAL_KBPS_MIN, TOTAL_KBPS_MAX, 100, MIN_USEFUL_TOTAL_KBPS, "total", "kb/s"
+        )
+
+        audio = self._card(right, "Audio")
+        agrid = tk.Frame(audio, bg=PANEL)
+        agrid.pack(fill="x")
+        agrid.columnconfigure(0, weight=1)
+        self._add_setting_row(
+            agrid, 0, "Bit rate", self.audio_kbps_var, AUDIO_KBPS_MIN, AUDIO_KBPS_MAX, 8, MIN_USEFUL_AUDIO_KBPS, "audio", "kb/s"
+        )
+        self._add_setting_row(
+            agrid,
+            1,
+            "Sample rate",
+            self.sample_rate_var,
+            SAMPLE_KHZ_MIN,
+            SAMPLE_KHZ_MAX,
+            1,
+            MIN_USEFUL_SAMPLE_KHZ,
+            "sample",
+            "kHz",
+        )
+
+        ttk.Label(audio, text="Sound source", style="Side.TLabel").pack(anchor="w", padx=2, pady=(12, 6))
+        self.audio_var = tk.StringVar(value="both")
+        audio_row = tk.Frame(audio, bg=PANEL2)
+        audio_row.pack(fill="x", pady=(0, 6))
+        for value, label in (("internal", "Internal"), ("external", "Mic"), ("both", "Both")):
+            ttk.Radiobutton(
+                audio_row,
+                text=label,
+                value=value,
+                variable=self.audio_var,
+                command=self._audio_changed,
+                style="Side.TRadiobutton",
+            ).pack(side="left", padx=8, pady=8)
+
+        mic_row = tk.Frame(audio, bg=PANEL2)
+        mic_row.pack(fill="x", pady=3)
+        tk.Label(mic_row, text="Mic", bg=PANEL2, fg=MUTED, font=("Segoe UI", 9), width=12, anchor="w").pack(
+            side="left", padx=(10, 4), pady=8
+        )
+        self.mic_var = tk.StringVar()
+        self.mic_combo = ttk.Combobox(mic_row, textvariable=self.mic_var, state="readonly")
+        self.mic_combo.pack(side="left", fill="x", expand=True, padx=(0, 10), pady=8)
+
+        lb_row = tk.Frame(audio, bg=PANEL2)
+        lb_row.pack(fill="x", pady=3)
+        tk.Label(lb_row, text="Loopback", bg=PANEL2, fg=MUTED, font=("Segoe UI", 9), width=12, anchor="w").pack(
+            side="left", padx=(10, 4), pady=8
+        )
+        self.loop_var = tk.StringVar()
+        self.loop_combo = ttk.Combobox(lb_row, textvariable=self.loop_var, state="readonly")
+        self.loop_combo.pack(side="left", fill="x", expand=True, padx=(0, 10), pady=8)
+
+        out = self._card(inner, "Save to")
+        path_row = tk.Frame(out, bg=PANEL2)
+        path_row.pack(fill="x")
+        self.dir_var = tk.StringVar(value=str(self.output_dir))
+        ttk.Entry(path_row, textvariable=self.dir_var).pack(side="left", fill="x", expand=True, padx=(10, 6), pady=8)
+        ttk.Button(path_row, text="Browse", style="Ghost.TButton", command=self._browse).pack(
+            side="left", padx=(0, 10), pady=8
+        )
+
+        self._syncing_rates = False
+        self.audio_kbps_var.trace_add("write", lambda *_: self._on_audio_or_video_rate())
+        self.sample_rate_var.trace_add("write", lambda *_: self._refresh_quality_hints())
+        self.video_kbps_var.trace_add("write", lambda *_: self._on_audio_or_video_rate())
+        self.total_kbps_var.trace_add("write", lambda *_: self._on_total_rate())
+        self.fps_var.trace_add("write", lambda *_: self._refresh_quality_hints())
+
+        self._bind_sidebar_scroll(canvas, inner)
+
+    def _tab_hover(self, key: str, on: bool) -> None:
+        if key == self._current_page:
+            return
+        self._tab_labels[key].configure(fg=FG if on else MUTED)
+
+    def _show_page(self, key: str) -> None:
+        if key not in self._pages:
+            return
+        for name, page in self._pages.items():
+            page.pack_forget()
+            active = name == key
+            self._tab_labels[name].configure(
+                fg=FG if active else MUTED,
+                font=("Segoe UI Semibold", 13),
+            )
+            self._tab_rules[name].configure(bg=ACCENT if active else BG)
+        self._pages[key].pack(fill="both", expand=True)
+        prev = self._current_page
+        self._current_page = key
+        if key == "recs" and prev != "recs":
+            sel = self.rec_list.selection()
+            keep = self._rec_by_id.get(sel[0]) if sel else None
+            self.refresh_recordings(select_path=keep)
+
+    def _bind_sidebar_scroll(self, canvas: tk.Canvas, inner: ttk.Frame) -> None:
+        def on_wheel(event: tk.Event) -> str:
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            return "break"
+
+        def bind_tree(widget: tk.Misc) -> None:
+            widget.bind("<MouseWheel>", on_wheel)
+            for child in widget.winfo_children():
+                bind_tree(child)
+
+        bind_tree(inner)
+        canvas.bind("<MouseWheel>", on_wheel)
 
     def _set_live_badge(self, mode: str) -> None:
         if mode == "rec":
@@ -501,8 +615,6 @@ class RecorderApp(tk.Tk):
             self._log(f"Hardware detect failed: {exc}")
             self.hw = None
         if self.hw:
-            report = format_involvement_report(self.hw, int(self.fps_var.get() or 30))
-            self._set_hw(report)
             self._log(self.hw.summary())
             if not self.hw.has_libvvenc:
                 self._log("ERROR: " + (self.hw.vvenc_skip_reason or "libvvenc missing"))
@@ -519,12 +631,6 @@ class RecorderApp(tk.Tk):
             self._log("MPC-HC not found. Re-run run.cmd to install clsid2.mpc-hc 2.8.2.")
             self.mpc_status.configure(text="MPC-HC missing")
         self.status_var.set("Ready  ·  F9 to record")
-
-    def _set_hw(self, text: str) -> None:
-        self.hw_box.configure(state="normal")
-        self.hw_box.delete("1.0", "end")
-        self.hw_box.insert("1.0", text)
-        self.hw_box.configure(state="disabled")
 
     def _log(self, msg: str) -> None:
         line = msg.rstrip()
@@ -663,52 +769,24 @@ class RecorderApp(tk.Tk):
             self._syncing_rates = False
         self._refresh_quality_hints()
 
-    def _set_hint(self, label: ttk.Label, warn: bool, warn_text: str, ok_text: str) -> None:
-        label.configure(style="Warn.TLabel" if warn else "Hint.TLabel", text=warn_text if warn else ok_text)
-
     def _refresh_quality_hints(self) -> None:
-        if getattr(self, "audio_hint", None) is None:
-            return
-        kbps = self._parse_int(self.audio_kbps_var, DEFAULT_AUDIO_KBPS)
-        self._set_hint(
-            self.audio_hint,
-            kbps < MIN_USEFUL_AUDIO_KBPS,
-            (
-                f"Below {MIN_USEFUL_AUDIO_KBPS} kb/s, audio is usually too thin to use. "
-                f"Stay at {DEFAULT_AUDIO_KBPS} unless you need a smaller file."
-            ),
-            f"Stay at {DEFAULT_AUDIO_KBPS} kb/s or above {MIN_USEFUL_AUDIO_KBPS} so speech stays usable.",
-        )
-        rate = self._parse_int(self.sample_rate_var, DEFAULT_SAMPLE_RATE)
-        self._set_hint(
-            self.sample_hint,
-            rate < MIN_USEFUL_SAMPLE_RATE,
-            (
-                f"Below {MIN_USEFUL_SAMPLE_RATE} Hz, speech gets muffled. "
-                f"Stay at {DEFAULT_SAMPLE_RATE} unless you need a smaller file."
-            ),
-            f"{DEFAULT_SAMPLE_RATE} Hz is a good default. Avoid going below {MIN_USEFUL_SAMPLE_RATE} Hz - speech gets muffled.",
-        )
-        video = self._parse_int(self.video_kbps_var, DEFAULT_VIDEO_KBPS)
-        self._set_hint(
-            self.video_hint,
-            video < MIN_USEFUL_VIDEO_KBPS,
-            (
-                f"Below {MIN_USEFUL_VIDEO_KBPS} kb/s, video is usually too blocky to use. "
-                "On-screen text and UI get hard to read."
-            ),
-            f"{DEFAULT_VIDEO_KBPS} kb/s is a smaller-file default. Avoid going below {MIN_USEFUL_VIDEO_KBPS} kb/s - on-screen text gets hard to read.",
-        )
-        total = self._parse_int(self.total_kbps_var, DEFAULT_TOTAL_KBPS)
-        self._set_hint(
-            self.total_hint,
-            total < MIN_USEFUL_TOTAL_KBPS,
-            (
-                f"Below {MIN_USEFUL_TOTAL_KBPS} kb/s total, the file is usually too thin to use. "
-                f"Keep video at {MIN_USEFUL_VIDEO_KBPS}+ and audio at {MIN_USEFUL_AUDIO_KBPS}+."
-            ),
-            f"Total is video + audio. Avoid going below {MIN_USEFUL_TOTAL_KBPS} kb/s.",
-        )
+        checks: list[tuple[str, tk.StringVar, int]] = [
+            ("fps", self.fps_var, 1),
+            ("audio", self.audio_kbps_var, DEFAULT_AUDIO_KBPS),
+            ("sample", self.sample_rate_var, DEFAULT_SAMPLE_KHZ),
+            ("video", self.video_kbps_var, DEFAULT_VIDEO_KBPS),
+            ("total", self.total_kbps_var, DEFAULT_TOTAL_KBPS),
+        ]
+        for key, var, fallback in checks:
+            lbl = self._min_labels.get(key)
+            if lbl is None:
+                continue
+            floor = self._min_floors.get(key, 0)
+            n = self._parse_int(var, fallback)
+            if n < floor:
+                lbl.configure(bg=CHIP_WARN_BG, fg=WARN)
+            else:
+                lbl.configure(bg=CHIP_BG, fg=MUTED)
 
     def _read_int_setting(
         self,
@@ -737,11 +815,12 @@ class RecorderApp(tk.Tk):
         )
         if audio_kbps is None:
             return None
-        sample_rate = self._read_int_setting(
-            self.sample_rate_var, "Sample rate", SAMPLE_RATE_MIN, SAMPLE_RATE_MAX, "48000"
+        sample_khz = self._read_int_setting(
+            self.sample_rate_var, "Sample rate", SAMPLE_KHZ_MIN, SAMPLE_KHZ_MAX, "48"
         )
-        if sample_rate is None:
+        if sample_khz is None:
             return None
+        sample_rate = sample_khz_to_hz(sample_khz)
         video_kbps = self._read_int_setting(
             self.video_kbps_var, "Data rate", VIDEO_KBPS_MIN, VIDEO_KBPS_MAX, "1500"
         )
@@ -759,10 +838,10 @@ class RecorderApp(tk.Tk):
                 "Speech and UI sounds often become hard to use. Record anyway?",
             ):
                 return None
-        if sample_rate < MIN_USEFUL_SAMPLE_RATE:
+        if sample_khz < MIN_USEFUL_SAMPLE_KHZ:
             if not messagebox.askyesno(
                 "Sample rate may be too low",
-                f"{sample_rate} Hz is below {MIN_USEFUL_SAMPLE_RATE} Hz. "
+                f"{sample_khz} kHz is below {MIN_USEFUL_SAMPLE_KHZ} kHz. "
                 "Speech often sounds muffled. Record anyway?",
             ):
                 return None
@@ -1163,7 +1242,7 @@ class RecorderApp(tk.Tk):
         self._log(
             f"Recording {window.label()} @ {fps} fps, "
             f"video {video_kbps} kb/s, total {total_kbps} kb/s, "
-            f"Opus {audio_kbps} kb/s {snap_opus_rate(sample_rate)} Hz -> {cfg.output.name}"
+            f"Opus {audio_kbps} kb/s {snap_opus_rate(sample_rate) // 1000} kHz -> {cfg.output.name}"
         )
 
     def _tick(self) -> None:
@@ -1211,23 +1290,10 @@ class RecorderApp(tk.Tk):
             self.refresh_recordings(log=True)
             return
         self.refresh_recordings(log=True, select_path=path)
-        try:
-            self.nb.select(self.recs_tab)
-        except tk.TclError:
-            pass
+        self._show_page("recs")
         if path:
             self._log(f"Saved {path.name}")
             self.status_var.set(f"Saved  ·  {path.name}")
-
-    def _on_tab(self, _event: object | None = None) -> None:
-        try:
-            current = self.nb.index(self.nb.select())
-        except tk.TclError:
-            return
-        if current == 1:
-            sel = self.rec_list.selection()
-            keep = self._rec_by_id.get(sel[0]) if sel else None
-            self.refresh_recordings(select_path=keep)
 
     def refresh_recordings(self, log: bool = False, select_path: Path | None = None) -> None:
         folder = Path(self.dir_var.get().strip() or self.output_dir)
