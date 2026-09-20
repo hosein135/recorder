@@ -399,9 +399,8 @@ class CaptureSession:
             self._grabber = WindowGrabber(self.cfg.window.hwnd, self._frame_w, self._frame_h)
             if window_is_minimized(self.cfg.window.hwnd):
                 self.on_log(
-                    "Target is minimized. Show it to capture live frames - "
-                    "Windows (and Action! Window mode) do not compose minimized windows. "
-                    "The window stays under your control; this recorder will not restore or hide it."
+                    f"Target is minimized — recording at restore size "
+                    f"{self._frame_w}x{self._frame_h}. The window stays minimized."
                 )
         else:
             geo = refresh_geometry(self.cfg.window)
@@ -503,15 +502,15 @@ class CaptureSession:
                             pass
                         elif state == "minimized":
                             self.on_log(
-                                "Window minimized - holding last frame. "
-                                "Restore it whenever you want; capture does not steal the window."
+                                "Window minimized — capture continues at restore size "
+                                "(window is not restored)."
                             )
                         elif state == "maximized":
                             self.on_log(
                                 "Window maximized - capture continues (letterboxed to recording size)."
                             )
                         elif state == "open":
-                            self.on_log("Window restored - live capture resumed.")
+                            self.on_log("Window restored — live on-screen capture.")
                 else:
                     frame = grab_screen_bgra(
                         self._screen_x,
@@ -565,6 +564,12 @@ class CaptureSession:
         self._grab_stop.set()
         if self._grab_thread:
             self._grab_thread.join(timeout=5)
+        if self._grabber is not None:
+            try:
+                self._grabber.close()
+            except Exception:
+                pass
+            self._grabber = None
 
         if self.proc and self.proc.poll() is None:
             try:
