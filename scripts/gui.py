@@ -522,7 +522,7 @@ class RecorderApp(tk.Tk):
         )
 
         ttk.Label(audio, text="Sound source", style="Side.TLabel").pack(anchor="w", padx=2, pady=(12, 6))
-        self.audio_var = tk.StringVar(value="both")
+        self.audio_var = tk.StringVar(value="internal")
         audio_row = tk.Frame(audio, bg=PANEL2)
         audio_row.pack(fill="x", pady=(0, 6))
         for value, label in (("internal", "Internal"), ("external", "Mic"), ("both", "Both")):
