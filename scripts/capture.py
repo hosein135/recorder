@@ -19,6 +19,16 @@ from windows import WindowInfo, WindowRestore, prepare_for_capture, refresh_geom
 
 CREATE_NO_WINDOW = 0x08000000
 
+DEFAULT_AUDIO_KBPS = 48
+MIN_USEFUL_AUDIO_KBPS = 24
+AUDIO_KBPS_MIN = 8
+AUDIO_KBPS_MAX = 256
+
+DEFAULT_VIDEO_QUALITY = 45
+MIN_USEFUL_VIDEO_QUALITY = 35
+VIDEO_QUALITY_MIN = 1
+VIDEO_QUALITY_MAX = 100
+
 
 @dataclass
 class RecordConfig:
@@ -28,7 +38,23 @@ class RecordConfig:
     output: Path
     microphone: AudioDevice | None = None
     loopback: AudioDevice | None = None
-    qp: int = 32
+    qp: int = 38
+    audio_kbps: int = DEFAULT_AUDIO_KBPS
+    video_quality: int = DEFAULT_VIDEO_QUALITY
+
+
+def clamp_audio_kbps(n: int) -> int:
+    return max(AUDIO_KBPS_MIN, min(AUDIO_KBPS_MAX, int(n)))
+
+
+def clamp_video_quality(n: int) -> int:
+    return max(VIDEO_QUALITY_MIN, min(VIDEO_QUALITY_MAX, int(n)))
+
+
+def quality_to_qp(quality: int) -> int:
+    """Map 1 (smallest / roughest) .. 100 (largest / sharpest) to libvvenc QP."""
+    q = clamp_video_quality(quality)
+    return int(round(22 + (100 - q) * 29 / 99))
 
 
 class RecorderError(RuntimeError):
@@ -162,8 +188,10 @@ def build_mux_cmd(
     video_path: Path,
     audio_path: Path,
     output: Path,
+    audio_kbps: int = DEFAULT_AUDIO_KBPS,
 ) -> list[str]:
     ffmpeg = _ffmpeg(hw)
+    kbps = clamp_audio_kbps(audio_kbps)
     return [
         ffmpeg,
         "-y",
@@ -177,9 +205,15 @@ def build_mux_cmd(
         "-c:v",
         "copy",
         "-c:a",
-        "aac",
+        "libopus",
         "-b:a",
-        "192k",
+        f"{kbps}k",
+        "-application",
+        "audio",
+        "-vbr",
+        "on",
+        "-ar",
+        "48000",
         "-shortest",
         "-movflags",
         "+faststart",
@@ -219,6 +253,10 @@ class CaptureSession:
     def start(self) -> None:
         if not self.hw.has_libvvenc:
             raise RecorderError(self.hw.vvenc_skip_reason or "libvvenc is not available")
+        if not getattr(self.hw, "has_libopus", False):
+            raise RecorderError(
+                "FFmpeg has no libopus. Install the Gyan.FFmpeg *full* build via run.cmd."
+            )
 
         self.cfg.output.parent.mkdir(parents=True, exist_ok=True)
         for p in (self.video_tmp, self.audio_tmp, self.cfg.output):
@@ -234,8 +272,9 @@ class CaptureSession:
             self._frame_w, self._frame_h = geo.even_size
             if self._restore.was_minimized:
                 self.on_log(
-                    f"Restored minimized window hwnd={self.cfg.window.hwnd} "
-                    f"to {self._frame_w}x{self._frame_h} (will minimize again on stop)"
+                    f"Minimized window hwnd={self.cfg.window.hwnd} "
+                    f"kept composable at {self._frame_w}x{self._frame_h} "
+                    f"(restored on stop if it was minimized)"
                 )
         else:
             geo = refresh_geometry(self.cfg.window)
@@ -254,7 +293,9 @@ class CaptureSession:
             loopback=self.cfg.loopback,
         )
         self.audio.start()
-        self.on_log(f"Audio: {self.cfg.audio_mode} (WASAPI)")
+        self.on_log(
+            f"Audio: {self.cfg.audio_mode} (WASAPI) → Opus {self.cfg.audio_kbps} kb/s"
+        )
 
         self.proc = subprocess.Popen(
             cmd,
@@ -317,6 +358,13 @@ class CaptureSession:
                     self._grab_stop.wait(0.05)
                     continue
                 if self._hwnd_mode:
+                    if self._restore is not None:
+                        hidden_before = self._restore._cloaked_by_us
+                        self._restore.ensure_composing()
+                        if self._restore._cloaked_by_us and not hidden_before:
+                            self.on_log(
+                                "Selected window was minimized - capture continues in the background"
+                            )
                     frame = grab_hwnd_bgra(hwnd, self._frame_w, self._frame_h)
                 else:
                     frame = grab_screen_bgra(
@@ -418,7 +466,9 @@ class CaptureSession:
             self.video_tmp.replace(self.cfg.output)
             return self.cfg.output
 
-        mux = build_mux_cmd(self.hw, self.video_tmp, self.audio_tmp, self.cfg.output)
+        mux = build_mux_cmd(
+            self.hw, self.video_tmp, self.audio_tmp, self.cfg.output, self.cfg.audio_kbps
+        )
         self.on_log("Mux: " + " ".join(mux))
         flags = CREATE_NO_WINDOW if sys.platform == "win32" else 0
         mux_proc = subprocess.run(
@@ -431,7 +481,7 @@ class CaptureSession:
         )
         if mux_proc.returncode != 0:
             self.on_log(mux_proc.stderr.strip() or "mux failed")
-            # Keep the VVC video even if AAC mux fails.
+            # Keep the VVC video even if Opus mux fails.
             fallback = self.cfg.output.with_suffix(".video-only.mp4")
             self.video_tmp.replace(fallback)
             raise RecorderError(

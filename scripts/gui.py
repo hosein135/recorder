@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import shutil
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -30,7 +32,24 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from audio import AudioDevice, default_loopback, default_microphone, list_loopbacks, list_microphones
-from capture import CaptureSession, RecordConfig, RecorderError, default_output_path
+from capture import (
+    AUDIO_KBPS_MAX,
+    AUDIO_KBPS_MIN,
+    CaptureSession,
+    DEFAULT_AUDIO_KBPS,
+    DEFAULT_VIDEO_QUALITY,
+    MIN_USEFUL_AUDIO_KBPS,
+    MIN_USEFUL_VIDEO_QUALITY,
+    RecordConfig,
+    RecorderError,
+    VIDEO_QUALITY_MAX,
+    VIDEO_QUALITY_MIN,
+    clamp_audio_kbps,
+    clamp_video_quality,
+    default_output_path,
+    quality_to_qp,
+)
+from hwnd_grab import grab_thumb_ppm
 from hw_detect import HardwareProfile, detect, format_involvement_report
 from player import find_mpc_hc, format_size, list_recordings, play_with_mpc
 from windows import WindowInfo, cursor_pos, escape_pressed, left_button_down, list_windows, window_at_point
@@ -48,8 +67,8 @@ class RecorderApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Window Recorder  ·  H.266 / VVC")
-        self.geometry("920x640")
-        self.minsize(780, 560)
+        self.geometry("960x720")
+        self.minsize(820, 620)
         self.configure(bg=BG)
 
         self.hw: HardwareProfile | None = None
@@ -77,6 +96,7 @@ class RecorderApp(tk.Tk):
         style.configure("Panel.TFrame", background=PANEL)
         style.configure("TLabel", background=BG, foreground=FG, font=("Segoe UI", 10))
         style.configure("Muted.TLabel", background=BG, foreground=MUTED, font=("Segoe UI", 9))
+        style.configure("Warn.TLabel", background=BG, foreground="#e8b849", font=("Segoe UI", 9))
         style.configure("Panel.TLabel", background=PANEL, foreground=FG)
         style.configure("Title.TLabel", background=BG, foreground=FG, font=("Segoe UI Semibold", 16))
         style.configure("TRadiobutton", background=BG, foreground=FG, font=("Segoe UI", 10))
@@ -98,7 +118,7 @@ class RecorderApp(tk.Tk):
         header = ttk.Frame(self)
         header.pack(fill="x", **pad)
         ttk.Label(header, text="Window Recorder", style="Title.TLabel").pack(side="left")
-        ttk.Label(header, text="FFmpeg libvvenc  ·  H.266 / VVC", style="Muted.TLabel").pack(
+        ttk.Label(header, text="FFmpeg libvvenc + libopus  ·  H.266 / VVC", style="Muted.TLabel").pack(
             side="left", padx=(12, 0)
         )
 
@@ -119,7 +139,12 @@ class RecorderApp(tk.Tk):
         btns = ttk.Frame(left)
         btns.pack(fill="x", padx=8, pady=(8, 4))
         ttk.Button(btns, text="Refresh", command=self.refresh_windows).pack(side="left")
-        ttk.Button(btns, text="Alt+Tab pick...", command=self._open_alt_tab_picker).pack(side="left", padx=(8, 0))
+        ttk.Button(btns, text="Choose window...", command=self._open_share_picker).pack(
+            side="left", padx=(8, 0)
+        )
+        ttk.Button(btns, text="Click on screen", command=self._start_click_pick).pack(
+            side="left", padx=(8, 0)
+        )
         ttk.Label(btns, text="Filter").pack(side="left", padx=(12, 4))
         self.filter_var = tk.StringVar()
         self.filter_var.trace_add("write", lambda *_: self._apply_filter())
@@ -127,7 +152,7 @@ class RecorderApp(tk.Tk):
         filt.pack(side="left", fill="x", expand=True)
         ttk.Label(
             left,
-            text="Front-to-back like Alt+Tab. Use Alt+Tab pick or click a window on screen.",
+            text="Pick a window the way you share a screen, or click one on the display.",
             style="Muted.TLabel",
         ).pack(anchor="w", padx=8)
 
@@ -179,6 +204,64 @@ class RecorderApp(tk.Tk):
         )
         fps.pack(side="left", padx=(8, 0))
         ttk.Label(row, text="type any integer 1-240", style="Muted.TLabel").pack(side="left", padx=(8, 0))
+
+        row = ttk.Frame(rec)
+        row.pack(fill="x", padx=10, pady=(6, 0))
+        ttk.Label(row, text="Audio kb/s").pack(side="left")
+        self.audio_kbps_var = tk.StringVar(value=str(DEFAULT_AUDIO_KBPS))
+        ttk.Spinbox(
+            row,
+            textvariable=self.audio_kbps_var,
+            from_=AUDIO_KBPS_MIN,
+            to=AUDIO_KBPS_MAX,
+            increment=8,
+            width=8,
+        ).pack(side="left", padx=(8, 0))
+        ttk.Label(
+            row,
+            text=f"Opus  ·  type {AUDIO_KBPS_MIN}-{AUDIO_KBPS_MAX}",
+            style="Muted.TLabel",
+        ).pack(side="left", padx=(8, 0))
+        self.audio_hint = ttk.Label(
+            rec,
+            text=(
+                f"{DEFAULT_AUDIO_KBPS} kb/s is a good default. Avoid going below "
+                f"{MIN_USEFUL_AUDIO_KBPS} kb/s - audio gets too thin to use."
+            ),
+            style="Muted.TLabel",
+            wraplength=340,
+        )
+        self.audio_hint.pack(anchor="w", padx=10, pady=(2, 0))
+
+        row = ttk.Frame(rec)
+        row.pack(fill="x", padx=10, pady=(8, 0))
+        ttk.Label(row, text="Video quality").pack(side="left")
+        self.quality_var = tk.StringVar(value=str(DEFAULT_VIDEO_QUALITY))
+        ttk.Spinbox(
+            row,
+            textvariable=self.quality_var,
+            from_=VIDEO_QUALITY_MIN,
+            to=VIDEO_QUALITY_MAX,
+            increment=1,
+            width=8,
+        ).pack(side="left", padx=(8, 0))
+        ttk.Label(
+            row,
+            text=f"1-{VIDEO_QUALITY_MAX}, higher = larger file",
+            style="Muted.TLabel",
+        ).pack(side="left", padx=(8, 0))
+        self.video_hint = ttk.Label(
+            rec,
+            text=(
+                f"{DEFAULT_VIDEO_QUALITY} is a smaller-file default. Avoid going below "
+                f"{MIN_USEFUL_VIDEO_QUALITY} - on-screen text gets hard to read."
+            ),
+            style="Muted.TLabel",
+            wraplength=340,
+        )
+        self.video_hint.pack(anchor="w", padx=10, pady=(2, 4))
+        self.audio_kbps_var.trace_add("write", lambda *_: self._refresh_quality_hints())
+        self.quality_var.trace_add("write", lambda *_: self._refresh_quality_hints())
 
         ttk.Label(rec, text="Audio", style="Muted.TLabel").pack(anchor="w", padx=10, pady=(8, 0))
         self.audio_var = tk.StringVar(value="both")
@@ -299,6 +382,8 @@ class RecorderApp(tk.Tk):
             self._log(self.hw.summary())
             if not self.hw.has_libvvenc:
                 self._log("ERROR: " + (self.hw.vvenc_skip_reason or "libvvenc missing"))
+            if not getattr(self.hw, "has_libopus", False):
+                self._log("ERROR: FFmpeg has no libopus. Install the Gyan.FFmpeg full build.")
         self.refresh_windows()
         self.refresh_audio()
         self.refresh_recordings(log=True)
@@ -414,6 +499,50 @@ class RecorderApp(tk.Tk):
             self._on_win_select()
         self._log(f"Target: {info.label()}")
 
+    def _refresh_quality_hints(self) -> None:
+        if getattr(self, "audio_hint", None) is None or getattr(self, "video_hint", None) is None:
+            return
+        try:
+            kbps = int(str(self.audio_kbps_var.get()).strip())
+        except ValueError:
+            kbps = DEFAULT_AUDIO_KBPS
+        if kbps < MIN_USEFUL_AUDIO_KBPS:
+            self.audio_hint.configure(
+                style="Warn.TLabel",
+                text=(
+                    f"Below {MIN_USEFUL_AUDIO_KBPS} kb/s, audio is usually too thin to use. "
+                    f"Stay at {DEFAULT_AUDIO_KBPS} unless you need a smaller file."
+                ),
+            )
+        else:
+            self.audio_hint.configure(
+                style="Muted.TLabel",
+                text=(
+                    f"{DEFAULT_AUDIO_KBPS} kb/s is a good default. Avoid going below "
+                    f"{MIN_USEFUL_AUDIO_KBPS} kb/s - audio gets too thin to use."
+                ),
+            )
+        try:
+            quality = int(str(self.quality_var.get()).strip())
+        except ValueError:
+            quality = DEFAULT_VIDEO_QUALITY
+        if quality < MIN_USEFUL_VIDEO_QUALITY:
+            self.video_hint.configure(
+                style="Warn.TLabel",
+                text=(
+                    f"Below {MIN_USEFUL_VIDEO_QUALITY}, video is usually too blocky to use. "
+                    "On-screen text and UI get hard to read."
+                ),
+            )
+        else:
+            self.video_hint.configure(
+                style="Muted.TLabel",
+                text=(
+                    f"{DEFAULT_VIDEO_QUALITY} is a smaller-file default. Avoid going below "
+                    f"{MIN_USEFUL_VIDEO_QUALITY} - on-screen text gets hard to read."
+                ),
+            )
+
     def _tk_hwnds(self, *widgets: tk.Misc) -> set[int]:
         ids: set[int] = set()
         for w in widgets:
@@ -431,58 +560,140 @@ class RecorderApp(tk.Tk):
                 pass
         return ids
 
-    def _open_alt_tab_picker(self) -> None:
+    def _open_share_picker(self) -> None:
         self.refresh_windows()
         dlg = tk.Toplevel(self)
-        dlg.title("Alt+Tab  -  pick a window")
+        dlg.title("Choose what to record")
         dlg.configure(bg=BG)
         dlg.transient(self)
         dlg.attributes("-topmost", True)
-        dlg.geometry("640x480")
+        dlg.geometry("760x560")
         ttk.Label(
             dlg,
-            text="Same order as Alt+Tab (front to back). Double-click or Enter to choose.",
+            text="Click a screen or window, the same way you share in a call.",
             style="Muted.TLabel",
         ).pack(anchor="w", padx=12, pady=(10, 4))
-        lb = tk.Listbox(
-            dlg,
-            bg=PANEL,
-            fg=FG,
-            selectbackground=ACCENT,
-            selectforeground="#fff",
-            font=("Segoe UI", 12),
-            activestyle="none",
-            relief="flat",
-        )
-        lb.pack(fill="both", expand=True, padx=12, pady=8)
-        items = list(self.windows)
-        for w in items:
-            lb.insert("end", w.label())
-        if items:
-            lb.selection_set(0)
-            lb.see(0)
-        lb.focus_set()
 
-        def confirm(_event: object | None = None) -> None:
-            sel = lb.curselection()
-            if not sel:
+        wrap = ttk.Frame(dlg)
+        wrap.pack(fill="both", expand=True, padx=12, pady=4)
+        canvas = tk.Canvas(wrap, bg=BG, highlightthickness=0)
+        scroll = ttk.Scrollbar(wrap, orient="vertical", command=canvas.yview)
+        host = ttk.Frame(canvas)
+        host.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=host, anchor="nw")
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+
+        status = ttk.Label(dlg, text="Loading thumbnails...", style="Muted.TLabel")
+        status.pack(anchor="w", padx=12)
+
+        bar = ttk.Frame(dlg)
+        bar.pack(fill="x", padx=12, pady=(4, 12))
+        ttk.Button(bar, text="Click on screen...", command=lambda: click_screen()).pack(side="left")
+        ttk.Button(bar, text="Cancel", command=lambda: close()).pack(side="right")
+
+        dlg._photos = []
+        thumb_dir = Path(tempfile.mkdtemp(prefix="recorder-share-"))
+        thumb_w, thumb_h = 216, 122
+        closed = {"done": False}
+
+        def on_wheel(event: tk.Event) -> None:
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", on_wheel))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+
+        def close() -> None:
+            if closed["done"]:
                 return
-            info = items[int(sel[0])]
-            dlg.destroy()
-            self._select_window_info(info)
+            closed["done"] = True
+            try:
+                canvas.unbind_all("<MouseWheel>")
+            except tk.TclError:
+                pass
+            try:
+                dlg.destroy()
+            except tk.TclError:
+                pass
+            shutil.rmtree(thumb_dir, ignore_errors=True)
 
         def click_screen() -> None:
-            dlg.destroy()
+            close()
             self._start_click_pick()
 
-        lb.bind("<Return>", confirm)
-        lb.bind("<Double-Button-1>", confirm)
-        lb.bind("<Escape>", lambda _e: dlg.destroy())
-        bar = ttk.Frame(dlg)
-        bar.pack(fill="x", padx=12, pady=(0, 12))
-        ttk.Button(bar, text="Click a window on screen...", command=click_screen).pack(side="left")
-        ttk.Button(bar, text="OK", command=confirm).pack(side="right")
-        ttk.Button(bar, text="Cancel", command=dlg.destroy).pack(side="right", padx=(0, 8))
+        def choose(info: WindowInfo) -> None:
+            close()
+            self._select_window_info(info)
+
+        def add_card(parent: ttk.Frame, col: int, row: int, info: WindowInfo, photo: tk.PhotoImage) -> None:
+            card = tk.Frame(
+                parent,
+                bg=PANEL,
+                highlightbackground=BORDER,
+                highlightthickness=1,
+                cursor="hand2",
+            )
+            card.grid(row=row, column=col, padx=8, pady=8, sticky="n")
+            img = tk.Label(card, image=photo, bg=PANEL, cursor="hand2")
+            img.pack(padx=6, pady=(6, 2))
+            title = info.title.replace("\n", " ").strip() or "(untitled)"
+            if info.is_desktop:
+                title = "Entire screen"
+            if len(title) > 34:
+                title = title[:31] + "..."
+            sub = "display" if info.is_desktop else (info.exe or "")
+            cap = tk.Label(
+                card,
+                text=f"{title}\n{sub}",
+                bg=PANEL,
+                fg=FG,
+                font=("Segoe UI", 9),
+                justify="center",
+                cursor="hand2",
+            )
+            cap.pack(padx=6, pady=(0, 8))
+
+            def on_click(_event: object | None = None, target: WindowInfo = info) -> None:
+                choose(target)
+
+            for w in (card, img, cap):
+                w.bind("<Button-1>", on_click)
+
+        def fill(rows: list[tuple[WindowInfo, Path]]) -> None:
+            if closed["done"] or not dlg.winfo_exists():
+                shutil.rmtree(thumb_dir, ignore_errors=True)
+                return
+            for child in host.winfo_children():
+                child.destroy()
+            dlg._photos.clear()
+            for i, (info, path) in enumerate(rows):
+                try:
+                    photo = tk.PhotoImage(file=str(path))
+                except tk.TclError:
+                    continue
+                dlg._photos.append(photo)
+                add_card(host, i % 3, i // 3, info, photo)
+            status.configure(text=f"{len(dlg._photos)} sources  -  click one to record it")
+
+        def worker() -> None:
+            packed: list[tuple[WindowInfo, Path]] = []
+            sources = list(self.windows[:37])
+            for i, info in enumerate(sources):
+                if closed["done"]:
+                    return
+                screen = (info.x, info.y, info.width, info.height) if info.is_desktop else None
+                ppm = grab_thumb_ppm(info.hwnd, thumb_w, thumb_h, screen)
+                path = thumb_dir / f"{i}.ppm"
+                try:
+                    path.write_bytes(ppm)
+                except OSError:
+                    continue
+                packed.append((info, path))
+            self.after(0, lambda: fill(packed))
+
+        dlg.protocol("WM_DELETE_WINDOW", close)
+        threading.Thread(target=worker, daemon=True, name="share-thumbs").start()
         dlg.grab_set()
         dlg.wait_window()
 
@@ -620,6 +831,12 @@ class RecorderApp(tk.Tk):
                 or "FFmpeg has no libvvenc. Install the Gyan.FFmpeg *full* build via run.cmd.",
             )
             return
+        if not getattr(self.hw, "has_libopus", False):
+            messagebox.showerror(
+                "Opus unavailable",
+                "FFmpeg has no libopus. Install the Gyan.FFmpeg *full* build via run.cmd.",
+            )
+            return
         window = self._selected_window()
         if window is None:
             messagebox.showwarning("Recorder", "Select a window (or Entire screen).")
@@ -632,6 +849,47 @@ class RecorderApp(tk.Tk):
         if fps < 1 or fps > 240:
             messagebox.showwarning("Recorder", "FPS must be a whole number between 1 and 240.")
             return
+
+        try:
+            audio_kbps = int(self.audio_kbps_var.get().strip())
+        except ValueError:
+            messagebox.showwarning("Recorder", "Audio kb/s must be a whole number you type, e.g. 48.")
+            return
+        if audio_kbps < AUDIO_KBPS_MIN or audio_kbps > AUDIO_KBPS_MAX:
+            messagebox.showwarning(
+                "Recorder",
+                f"Audio kb/s must be a whole number between {AUDIO_KBPS_MIN} and {AUDIO_KBPS_MAX}.",
+            )
+            return
+        if audio_kbps < MIN_USEFUL_AUDIO_KBPS:
+            if not messagebox.askyesno(
+                "Audio may be too thin",
+                f"{audio_kbps} kb/s is below {MIN_USEFUL_AUDIO_KBPS} kb/s. "
+                "Speech and UI sounds often become hard to use. Record anyway?",
+            ):
+                return
+
+        try:
+            quality = int(self.quality_var.get().strip())
+        except ValueError:
+            messagebox.showwarning(
+                "Recorder", "Video quality must be a whole number you type, e.g. 45."
+            )
+            return
+        if quality < VIDEO_QUALITY_MIN or quality > VIDEO_QUALITY_MAX:
+            messagebox.showwarning(
+                "Recorder",
+                f"Video quality must be a whole number between {VIDEO_QUALITY_MIN} and {VIDEO_QUALITY_MAX}.",
+            )
+            return
+        if quality < MIN_USEFUL_VIDEO_QUALITY:
+            if not messagebox.askyesno(
+                "Video may be too rough",
+                f"Quality {quality} is below {MIN_USEFUL_VIDEO_QUALITY}. "
+                "On-screen text and UI often become hard to read. Record anyway?",
+            ):
+                return
+        qp = quality_to_qp(quality)
 
         mode = self.audio_var.get()
         mic = self._device_by_label(self.mics, self.mic_var.get()) if mode in ("external", "both") else None
@@ -654,6 +912,9 @@ class RecorderApp(tk.Tk):
             output=default_output_path(out_dir, window),
             microphone=mic,
             loopback=loop,
+            qp=qp,
+            audio_kbps=clamp_audio_kbps(audio_kbps),
+            video_quality=clamp_video_quality(quality),
         )
         self.session = CaptureSession(cfg, self.hw, on_log=self._log)
         try:
@@ -669,7 +930,10 @@ class RecorderApp(tk.Tk):
         except tk.TclError:
             pass
         self._tick()
-        self._log(f"Recording {window.label()} @ {fps} fps → {cfg.output.name}")
+        self._log(
+            f"Recording {window.label()} @ {fps} fps, quality {quality} (qp {qp}), "
+            f"Opus {audio_kbps} kb/s → {cfg.output.name}"
+        )
 
     def _tick(self) -> None:
         if not self.session:

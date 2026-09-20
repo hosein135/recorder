@@ -11,7 +11,9 @@ from __future__ import annotations
 import ctypes
 from ctypes import wintypes
 
-from windows import current_frame_rect
+import numpy as np
+
+from windows import grab_source_rect
 
 user32 = ctypes.windll.user32
 gdi32 = ctypes.windll.gdi32
@@ -126,7 +128,7 @@ def grab_hwnd_bgra(hwnd: int, out_w: int, out_h: int) -> bytes:
     """Return one BGRA frame of out_w x out_h from hwnd (stretched if resized)."""
     if not user32.IsWindow(hwnd):
         raise RuntimeError("Window closed during capture")
-    _x, _y, src_w, src_h = current_frame_rect(hwnd)
+    _x, _y, src_w, src_h = grab_source_rect(hwnd)
     src_w = _even(src_w)
     src_h = _even(src_h)
     if src_w < 2 or src_h < 2:
@@ -197,3 +199,48 @@ def grab_screen_bgra(x: int, y: int, src_w: int, src_h: int, out_w: int, out_h: 
         gdi32.DeleteDC(hdc_src)
         gdi32.DeleteDC(hdc_dst)
         user32.ReleaseDC(0, hdc_screen)
+
+
+def bgra_to_ppm(bgra: bytes, width: int, height: int) -> bytes:
+    expected = width * height * 4
+    arr = np.frombuffer(bgra, dtype=np.uint8)
+    if arr.size < expected:
+        arr = np.pad(arr, (0, expected - int(arr.size)))
+    rgb = arr[:expected].reshape(height, width, 4)[:, :, [2, 1, 0]]
+    header = f"P6\n{width} {height}\n255\n".encode("ascii")
+    return header + rgb.tobytes()
+
+
+def placeholder_ppm(width: int, height: int) -> bytes:
+    rgb = bytes([45, 48, 56]) * (width * height)
+    return f"P6\n{width} {height}\n255\n".encode("ascii") + rgb
+
+
+def _nearly_black(bgra: bytes) -> bool:
+    if not bgra:
+        return True
+    arr = np.frombuffer(bgra, dtype=np.uint8)
+    if arr.size < 16:
+        return True
+    sample = arr.reshape(-1, 4)[::16, :3]
+    return int(sample.max()) < 12
+
+
+def grab_thumb_ppm(
+    hwnd: int,
+    out_w: int,
+    out_h: int,
+    screen: tuple[int, int, int, int] | None = None,
+) -> bytes:
+    """Small PPM for a screen-share style picker. Never raises."""
+    try:
+        if hwnd == 0 and screen is not None:
+            x, y, w, h = screen
+            data = grab_screen_bgra(x, y, w, h, out_w, out_h)
+        else:
+            data = grab_hwnd_bgra(hwnd, out_w, out_h)
+        if _nearly_black(data):
+            return placeholder_ppm(out_w, out_h)
+        return bgra_to_ppm(data, out_w, out_h)
+    except Exception:
+        return placeholder_ppm(out_w, out_h)

@@ -24,10 +24,19 @@ if sys.platform != "win32":
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 dwmapi = ctypes.windll.dwmapi
+dwmapi.DwmSetWindowAttribute.argtypes = [
+    wintypes.HWND,
+    ctypes.c_uint,
+    ctypes.c_void_p,
+    wintypes.DWORD,
+]
+dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
 
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+DWMWA_CLOAK = 13
 DWMWA_CLOAKED = 14
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
+HWND_BOTTOM = 1
 GWL_EXSTYLE = -20
 WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_APPWINDOW = 0x00040000
@@ -188,13 +197,104 @@ class WindowRestore:
     hwnd: int
     was_minimized: bool
     _placement: WINDOWPLACEMENT | None = field(default=None, repr=False)
+    _cloaked_by_us: bool = field(default=False, repr=False)
+    _user_minimized: bool = field(default=False, repr=False)
+    _kick_done: bool = field(default=False, repr=False)
+    _saved_pos: tuple[int, int] | None = field(default=None, repr=False)
+    _last_kick: float = field(default=0.0, repr=False)
+
+    def ensure_composing(self) -> None:
+        """Keep DWM pixels flowing even if the user minimizes the target."""
+        hwnd = self.hwnd
+        if not hwnd or not user32.IsWindow(hwnd):
+            return
+        iconic = bool(user32.IsIconic(hwnd))
+        cloaked = _is_cloaked(hwnd)
+        if iconic:
+            self._user_minimized = True
+            now = time.monotonic()
+            if self._last_kick and now - self._last_kick < 0.4:
+                return
+            self._last_kick = now
+            self._restore_hidden()
+            return
+        if self._cloaked_by_us:
+            if not cloaked and self._saved_pos is None:
+                # User brought the window back (taskbar / restore).
+                self._cloaked_by_us = False
+                self._user_minimized = False
+            return
+        self._user_minimized = False
+
+    def _restore_hidden(self) -> None:
+        hwnd = self.hwnd
+        wp = _placement(hwnd)
+        if wp is not None:
+            wp.showCmd = SW_SHOWNOACTIVATE
+            user32.SetWindowPlacement(hwnd, ctypes.byref(wp))
+        else:
+            user32.ShowWindow(hwnd, SW_RESTORE)
+        user32.SetWindowPos(
+            hwnd,
+            HWND_BOTTOM,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+        if not _set_cloak(hwnd, True):
+            # Cloak unavailable: park the restored window off the virtual screen.
+            vx = user32.GetSystemMetrics(76)
+            x, y, w, _h = _normal_rect(hwnd)
+            if self._saved_pos is None:
+                self._saved_pos = (x, y)
+            user32.SetWindowPos(
+                hwnd,
+                HWND_BOTTOM,
+                int(vx - max(w, 64) - 80),
+                y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            )
+        self._cloaked_by_us = True
+        if not self._kick_done:
+            time.sleep(0.25)
+            user32.RedrawWindow(hwnd, None, None, 0x0103)
+            time.sleep(0.05)
+            self._kick_done = True
+        else:
+            time.sleep(0.05)
+            user32.RedrawWindow(hwnd, None, None, 0x0103)
 
     def revert(self) -> None:
-        if not self.was_minimized or self._placement is None:
-            return
         if not user32.IsWindow(self.hwnd):
             return
-        user32.SetWindowPlacement(self.hwnd, ctypes.byref(self._placement))
+        hwnd = self.hwnd
+        if self._cloaked_by_us:
+            _set_cloak(hwnd, False)
+            self._cloaked_by_us = False
+        if self._saved_pos is not None:
+            x, y = self._saved_pos
+            user32.SetWindowPos(
+                hwnd,
+                HWND_NOTOPMOST,
+                x,
+                y,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+            self._saved_pos = None
+        if self._user_minimized or self.was_minimized:
+            if self._placement is not None:
+                user32.SetWindowPlacement(hwnd, ctypes.byref(self._placement))
+            else:
+                user32.ShowWindow(hwnd, SW_SHOWMINIMIZED)
+            return
+        if self._placement is not None and self.was_minimized:
+            user32.SetWindowPlacement(hwnd, ctypes.byref(self._placement))
 
 
 def _window_title(hwnd: int) -> str:
@@ -222,6 +322,21 @@ def _is_cloaked(hwnd: int) -> bool:
             ctypes.sizeof(cloaked),
         )
         return hr == 0 and cloaked.value != 0
+    except OSError:
+        return False
+
+
+def _set_cloak(hwnd: int, cloak: bool) -> bool:
+    """Hide the HWND from the user while DWM still composes it (PrintWindow works)."""
+    val = wintypes.BOOL(1 if cloak else 0)
+    try:
+        hr = dwmapi.DwmSetWindowAttribute(
+            wintypes.HWND(hwnd),
+            DWMWA_CLOAK,
+            ctypes.byref(val),
+            ctypes.sizeof(val),
+        )
+        return hr == 0
     except OSError:
         return False
 
@@ -300,6 +415,14 @@ def current_frame_rect(hwnd: int) -> tuple[int, int, int, int]:
     return 0, 0, 0, 0
 
 
+def grab_source_rect(hwnd: int) -> tuple[int, int, int, int]:
+    """Size PrintWindow should use; falls back to the restore rect if iconic."""
+    x, y, w, h = current_frame_rect(hwnd)
+    if w >= 2 and h >= 2:
+        return x, y, w, h
+    return _normal_rect(hwnd)
+
+
 def _virtual_screen() -> WindowInfo:
     x = user32.GetSystemMetrics(76)
     y = user32.GetSystemMetrics(77)
@@ -338,8 +461,8 @@ def _is_self(hwnd: int, pid: int, title: str, class_name: str) -> bool:
     return False
 
 
-def _is_alt_tab_window(hwnd: int) -> bool:
-    """Same membership rules as the Windows Alt+Tab switcher (plus browsers)."""
+def _is_share_target(hwnd: int) -> bool:
+    """Windows a screen-share picker would offer (plus browsers)."""
     if not user32.IsWindow(hwnd):
         return False
     class_name = _class_name(hwnd)
@@ -389,7 +512,7 @@ def _is_alt_tab_window(hwnd: int) -> bool:
 
 def _info_from_hwnd(hwnd: int) -> WindowInfo | None:
     hwnd = int(hwnd)
-    if not _is_alt_tab_window(hwnd):
+    if not _is_share_target(hwnd):
         return None
     pid_dw = wintypes.DWORD(0)
     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid_dw))
@@ -413,7 +536,7 @@ def _info_from_hwnd(hwnd: int) -> WindowInfo | None:
 
 
 def list_windows() -> list[WindowInfo]:
-    """Alt+Tab order: Z-order from front to back, Entire screen first."""
+    """Screen-share order: Z-order from front to back, Entire screen first."""
     found: list[WindowInfo] = []
     seen: set[int] = set()
 
@@ -443,7 +566,7 @@ def list_windows() -> list[WindowInfo]:
 
 
 def window_at_point(x: int, y: int, exclude_hwnds: set[int] | None = None) -> WindowInfo | None:
-    """Top-level window under a screen point (what you would Alt+Tab to)."""
+    """Top-level window under a screen point (share-picker target)."""
     exclude_hwnds = exclude_hwnds or set()
     pt = POINT(int(x), int(y))
     hwnd = int(user32.WindowFromPoint(pt) or 0)
@@ -483,9 +606,7 @@ def refresh_geometry(info: WindowInfo) -> WindowInfo:
         return _virtual_screen()
     if not user32.IsWindow(info.hwnd):
         return info
-    x, y, w, h = _normal_rect(info.hwnd)
-    if not user32.IsIconic(info.hwnd):
-        x, y, w, h = current_frame_rect(info.hwnd)
+    x, y, w, h = grab_source_rect(info.hwnd)
     return WindowInfo(
         hwnd=info.hwnd,
         title=_window_title(info.hwnd) or info.title,
@@ -503,10 +624,10 @@ def refresh_geometry(info: WindowInfo) -> WindowInfo:
 
 
 def prepare_for_capture(info: WindowInfo) -> WindowRestore:
-    """Restore a minimized/hidden HWND so DWM has pixels for that window.
+    """Make a (possibly minimized) HWND composable without leaving it in the user's face.
 
-    The window is shown without forcing it topmost. Caller must revert()
-    after recording to put a previously minimized window back.
+    Minimized targets are restored then DWM-cloaked so PrintWindow still
+    gets pixels. Caller must revert() after recording.
     """
     token = WindowRestore(hwnd=info.hwnd, was_minimized=False)
     if info.is_desktop or not info.hwnd:
@@ -519,21 +640,9 @@ def prepare_for_capture(info: WindowInfo) -> WindowRestore:
     token.was_minimized = bool(user32.IsIconic(hwnd)) or (
         wp is not None and wp.showCmd == SW_SHOWMINIMIZED
     )
+    token._user_minimized = token.was_minimized
     if token.was_minimized:
-        user32.ShowWindow(hwnd, SW_RESTORE)
-        user32.SetWindowPos(
-            hwnd,
-            HWND_NOTOPMOST,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-        )
-        # DWM needs a beat after restore before PrintWindow has content.
-        time.sleep(0.25)
-        user32.RedrawWindow(hwnd, None, None, 0x0103)  # RDW_INVALIDATE|ERASE|UPDATENOW
-        time.sleep(0.05)
+        token.ensure_composing()
     return token
 
 

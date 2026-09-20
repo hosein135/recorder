@@ -36,6 +36,7 @@ class HardwareProfile:
     has_nvenc: bool = False
     has_qsv: bool = False
     has_libvvenc: bool = False
+    has_libopus: bool = False
     has_gdigrab: bool = False
     has_ddagrab: bool = False
     has_dshow: bool = False
@@ -67,8 +68,8 @@ class HardwareProfile:
         return (
             f"CPU={self.cpu_name} ({self.cpu_count} threads) | "
             f"NVIDIA=[{nvidia}] IntelGPU=[{intel}] "
-            f"libvvenc={self.has_libvvenc} ddagrab={self.has_ddagrab} "
-            f"gdigrab={self.has_gdigrab}"
+            f"libvvenc={self.has_libvvenc} libopus={self.has_libopus} "
+            f"ddagrab={self.has_ddagrab} gdigrab={self.has_gdigrab}"
         )
 
 
@@ -261,6 +262,8 @@ def detect() -> HardwareProfile:
     if not profile.has_gdigrab and not profile.has_ddagrab:
         profile.capture_skip_reason = "FFmpeg build has neither gdigrab nor ddagrab"
 
+    profile.has_libopus = "libopus" in enc
+
     if "libvvenc" in enc:
         profile.has_libvvenc = _probe_encoder(
             profile.ffmpeg_path,
@@ -406,10 +409,11 @@ def format_involvement_report(hw: HardwareProfile, fps: int = 30) -> str:
         lines.append(f"  Other:  {', '.join(hw.other_gpus)}")
     lines += [
         f"  FFmpeg: {hw.ffmpeg_version or hw.ffmpeg_path or '(missing)'}",
-        f"  Caps:   libvvenc={hw.has_libvvenc} gdigrab={hw.has_gdigrab} "
-        f"ddagrab={hw.has_ddagrab} NVENC={hw.has_nvenc} QSV={hw.has_qsv}",
+        f"  Caps:   libvvenc={hw.has_libvvenc} libopus={hw.has_libopus} "
+        f"gdigrab={hw.has_gdigrab} ddagrab={hw.has_ddagrab} "
+        f"NVENC={hw.has_nvenc} QSV={hw.has_qsv}",
         f"  Plan:   capture window via GDI; encode H.266 with libvvenc "
-        f"({hw.recommended_vvenc_preset(fps)})",
+        f"({hw.recommended_vvenc_preset(fps)}); audio Opus",
         "=== Involvement (this recorder) ===",
     ]
     for row in involvement_rows(hw, fps):
@@ -437,6 +441,7 @@ def main() -> int:
                     "intel_gpus": hw.intel_gpus,
                     "other_gpus": hw.other_gpus,
                     "has_libvvenc": hw.has_libvvenc,
+                    "has_libopus": hw.has_libopus,
                     "has_gdigrab": hw.has_gdigrab,
                     "has_ddagrab": hw.has_ddagrab,
                     "has_nvenc": hw.has_nvenc,

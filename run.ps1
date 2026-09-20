@@ -496,13 +496,17 @@ if (-not $pythonCmd) {
 Write-Section "Bootstrap: FFmpeg (full build, libvvenc)"
 Ensure-WingetPackage -Id "Gyan.FFmpeg" -Name "FFmpeg" -Version $ffmpegTargetVersion -CommandName "ffmpeg" -WingetPackagesRoot $wingetPackagesRoot
 
-Write-Host "Verifying FFmpeg + libvvenc..." -ForegroundColor Cyan
+Write-Host "Verifying FFmpeg + libvvenc + libopus..." -ForegroundColor Cyan
 ffmpeg -version | Select-Object -First 1
 $encoders = & ffmpeg -hide_banner -encoders 2>&1 | Out-String
 if ($encoders -notmatch 'libvvenc') {
     throw "This FFmpeg build has no libvvenc (H.266). Install Gyan.FFmpeg full, not Essentials."
 }
 Write-Host "  libvvenc is present." -ForegroundColor Green
+if ($encoders -notmatch 'libopus') {
+    throw "This FFmpeg build has no libopus. Install Gyan.FFmpeg full, not Essentials."
+}
+Write-Host "  libopus is present." -ForegroundColor Green
 
 ## 5b. MPC-HC (Media Player Classic) 2.8.2
 Write-Section "Bootstrap: MPC-HC $mpcTargetVersion"
