@@ -38,6 +38,7 @@ from capture import (
     AUDIO_KBPS_MIN,
     CaptureSession,
     DEFAULT_AUDIO_KBPS,
+    DEFAULT_FPS,
     DEFAULT_SAMPLE_KHZ,
     DEFAULT_TOTAL_KBPS,
     DEFAULT_VIDEO_KBPS,
@@ -486,7 +487,7 @@ class RecorderApp(tk.Tk):
         grid.pack(fill="x")
         grid.columnconfigure(0, weight=1)
 
-        self.fps_var = tk.StringVar(value="30")
+        self.fps_var = tk.StringVar(value=str(DEFAULT_FPS))
         self.audio_kbps_var = tk.StringVar(value=str(DEFAULT_AUDIO_KBPS))
         self.sample_rate_var = tk.StringVar(value=str(DEFAULT_SAMPLE_KHZ))
         self.video_kbps_var = tk.StringVar(value=str(DEFAULT_VIDEO_KBPS))
@@ -851,18 +852,18 @@ class RecorderApp(tk.Tk):
     def _read_rate_settings(self) -> tuple[int, int, int, int] | None:
         self._commit_settings()
         audio_kbps = self._read_int_setting(
-            self.audio_kbps_var, "Audio kb/s", AUDIO_KBPS_MIN, AUDIO_KBPS_MAX, "48"
+            self.audio_kbps_var, "Audio kb/s", AUDIO_KBPS_MIN, AUDIO_KBPS_MAX, str(DEFAULT_AUDIO_KBPS)
         )
         if audio_kbps is None:
             return None
         sample_khz = self._read_int_setting(
-            self.sample_rate_var, "Sample rate", SAMPLE_KHZ_MIN, SAMPLE_KHZ_MAX, "48"
+            self.sample_rate_var, "Sample rate", SAMPLE_KHZ_MIN, SAMPLE_KHZ_MAX, str(DEFAULT_SAMPLE_KHZ)
         )
         if sample_khz is None:
             return None
         sample_rate = sample_khz_to_hz(sample_khz)
         video_kbps = self._read_int_setting(
-            self.video_kbps_var, "Data rate", VIDEO_KBPS_MIN, VIDEO_KBPS_MAX, "1500"
+            self.video_kbps_var, "Data rate", VIDEO_KBPS_MIN, VIDEO_KBPS_MAX, str(DEFAULT_VIDEO_KBPS)
         )
         if video_kbps is None:
             return None
@@ -1233,7 +1234,7 @@ class RecorderApp(tk.Tk):
             self._commit_settings()
             fps = int(self.fps_var.get().strip())
         except ValueError:
-            messagebox.showwarning("Recorder", "FPS must be a whole number you type, e.g. 30 or 60.")
+            messagebox.showwarning("Recorder", "FPS must be a whole number you type, e.g. 5 or 30.")
             return
         if fps < 1 or fps > 240:
             messagebox.showwarning("Recorder", "FPS must be a whole number between 1 and 240.")
