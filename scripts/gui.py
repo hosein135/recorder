@@ -57,6 +57,7 @@ from capture import (
     clamp_sample_rate,
     clamp_video_kbps,
     default_output_path,
+    probe_summary,
     sample_khz_to_hz,
     snap_opus_rate,
 )
@@ -419,7 +420,7 @@ class RecorderApp(tk.Tk):
         )
 
         rec_wrap = ttk.Frame(self.recs_tab)
-        rec_wrap.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        rec_wrap.pack(fill="both", expand=True, padx=12, pady=(0, 4))
         rec_cols = ("name", "size", "modified")
         self.rec_list = ttk.Treeview(rec_wrap, columns=rec_cols, show="headings", selectmode="browse")
         self.rec_list.heading("name", text="File")
@@ -432,6 +433,8 @@ class RecorderApp(tk.Tk):
         self.rec_list.configure(yscrollcommand=rec_scroll.set)
         self.rec_list.pack(side="left", fill="both", expand=True)
         rec_scroll.pack(side="right", fill="y")
+        self.rec_info = ttk.Label(self.recs_tab, text="", style="Muted.TLabel")
+        self.rec_info.pack(fill="x", padx=12, pady=(0, 10))
         self.rec_list.bind("<Double-Button-1>", self._on_recording_click)
         self.rec_list.bind("<Return>", self._on_recording_enter)
         self.rec_list.bind("<<TreeviewSelect>>", lambda _e: self._sync_play_btn())
@@ -548,6 +551,11 @@ class RecorderApp(tk.Tk):
         self.loop_var = tk.StringVar()
         self.loop_combo = ttk.Combobox(lb_row, textvariable=self.loop_var, state="readonly")
         self.loop_combo.pack(side="left", fill="x", expand=True, padx=(0, 10), pady=8)
+        ttk.Label(
+            audio,
+            text="Opus in MP4 is always listed as 48 kHz in Windows Properties. Encoding still uses the kHz you set.",
+            style="Side.TLabel",
+        ).pack(anchor="w", padx=2, pady=(8, 0))
 
         out = self._card(inner, "Save to")
         path_row = tk.Frame(out, bg=PANEL2)
@@ -1393,6 +1401,18 @@ class RecorderApp(tk.Tk):
             return
         state = "normal" if self.rec_list.selection() else "disabled"
         self.play_btn.configure(state=state)
+        self._update_rec_info()
+
+    def _update_rec_info(self) -> None:
+        if getattr(self, "rec_info", None) is None:
+            return
+        sel = self.rec_list.selection()
+        path = self._rec_by_id.get(sel[0]) if sel else None
+        if path is None or self.hw is None or not path.is_file():
+            self.rec_info.configure(text="")
+            return
+        summary = probe_summary(self.hw, path)
+        self.rec_info.configure(text=summary or str(path))
 
     def _play_selected(self) -> None:
         sel = self.rec_list.selection()

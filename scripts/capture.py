@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import sys
@@ -81,6 +82,81 @@ def clamp_video_kbps(n: int) -> int:
 
 def clamp_total_kbps(n: int) -> int:
     return max(TOTAL_KBPS_MIN, min(TOTAL_KBPS_MAX, int(n)))
+
+
+def _ffprobe(hw: HardwareProfile) -> str:
+    ffmpeg = Path(_ffmpeg(hw))
+    name = "ffprobe.exe" if ffmpeg.suffix.lower() == ".exe" else "ffprobe"
+    sibling = ffmpeg.with_name(name)
+    if sibling.is_file():
+        return str(sibling)
+    return shutil.which("ffprobe") or "ffprobe"
+
+
+def probe_summary(hw: HardwareProfile, path: Path) -> str:
+    """Human line from ffprobe so Activity/Recordings show real stream numbers."""
+    try:
+        proc = subprocess.run(
+            [
+                _ffprobe(hw),
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration,bit_rate,size:stream=codec_type,codec_name,width,height,r_frame_rate,avg_frame_rate,bit_rate,sample_rate,channels",
+                "-of",
+                "json",
+                str(path),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return ""
+        data = json.loads(proc.stdout)
+    except Exception:
+        return ""
+    fmt = data.get("format") or {}
+    video = next((s for s in data.get("streams") or [] if s.get("codec_type") == "video"), {})
+    audio = next((s for s in data.get("streams") or [] if s.get("codec_type") == "audio"), {})
+
+    def _kbps(raw: object) -> str:
+        try:
+            n = int(str(raw))
+        except (TypeError, ValueError):
+            return "?"
+        if n <= 0:
+            return "?"
+        return str(max(1, round(n / 1000)))
+
+    w, h = video.get("width"), video.get("height")
+    fps_raw = str(video.get("avg_frame_rate") or video.get("r_frame_rate") or "")
+    fps = fps_raw
+    if "/" in fps_raw:
+        num, den = fps_raw.split("/", 1)
+        try:
+            fps = f"{int(num) / int(den):.2f}".rstrip("0").rstrip(".")
+        except (TypeError, ValueError, ZeroDivisionError):
+            fps = fps_raw
+    size = fmt.get("size")
+    try:
+        size_txt = f"{int(size) / 1024:.0f} KB"
+    except (TypeError, ValueError):
+        size_txt = ""
+    ar = audio.get("sample_rate")
+    ar_txt = f"container {int(ar) / 1000:g} kHz" if str(ar).isdigit() else ""
+    bits = [
+        f"{w}x{h}" if w and h else "",
+        f"{fps} fps" if fps else "",
+        f"file {_kbps(fmt.get('bit_rate'))} kb/s" if fmt.get("bit_rate") else "",
+        f"video {_kbps(video.get('bit_rate'))} kb/s" if video.get("bit_rate") else "",
+        f"audio {_kbps(audio.get('bit_rate'))} kb/s" if audio.get("bit_rate") else "",
+        ar_txt,
+        size_txt,
+    ]
+    return "  |  ".join(p for p in bits if p)
 
 
 class RecorderError(RuntimeError):
@@ -226,11 +302,12 @@ def build_mux_cmd(
     output: Path,
     audio_kbps: int = DEFAULT_AUDIO_KBPS,
     sample_rate: int = DEFAULT_SAMPLE_RATE,
+    comment: str = "",
 ) -> list[str]:
     ffmpeg = _ffmpeg(hw)
     kbps = clamp_audio_kbps(audio_kbps)
     rate = snap_opus_rate(sample_rate)
-    return [
+    cmd = [
         ffmpeg,
         "-y",
         "-hide_banner",
@@ -253,7 +330,7 @@ def build_mux_cmd(
         "-application",
         "audio",
         "-vbr",
-        "on",
+        "off",
         "-b:a",
         f"{kbps}k",
         "-ar",
@@ -261,8 +338,11 @@ def build_mux_cmd(
         "-shortest",
         "-movflags",
         "+faststart",
-        str(output),
     ]
+    if comment:
+        cmd += ["-metadata", f"comment={comment}"]
+    cmd.append(str(output))
+    return cmd
 
 
 class CaptureSession:
@@ -532,6 +612,12 @@ class CaptureSession:
             self.cfg.output,
             self.cfg.audio_kbps,
             self.cfg.sample_rate,
+            comment=(
+                f"{self.cfg.fps} fps, video {self.cfg.video_kbps} kb/s, "
+                f"audio {self.cfg.audio_kbps} kb/s, "
+                f"{snap_opus_rate(self.cfg.sample_rate) // 1000} kHz Opus, "
+                f"total {clamp_video_kbps(self.cfg.video_kbps) + clamp_audio_kbps(self.cfg.audio_kbps)} kb/s"
+            ),
         )
         self.on_log("Mux: " + " ".join(mux))
         flags = CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -555,4 +641,7 @@ class CaptureSession:
         self.video_tmp.unlink(missing_ok=True)
         self.audio_tmp.unlink(missing_ok=True)
         self.on_log(f"Wrote {self.cfg.output}")
+        summary = probe_summary(self.hw, self.cfg.output)
+        if summary:
+            self.on_log("File: " + summary)
         return self.cfg.output

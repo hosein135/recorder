@@ -280,11 +280,22 @@ def current_frame_rect(hwnd: int) -> tuple[int, int, int, int]:
 
 
 def grab_source_rect(hwnd: int) -> tuple[int, int, int, int]:
-    """Size PrintWindow should use; falls back to the restore rect if iconic."""
-    x, y, w, h = current_frame_rect(hwnd)
-    if w >= 2 and h >= 2:
-        return x, y, w, h
-    return _normal_rect(hwnd)
+    """Pixel size PrintWindow / the encoder should use.
+
+    GetWindowRect of a minimized (or DWM-thumbnail) window is often a tiny
+    taskbar ghost such as 146x20. That size was being written into the MP4, so
+    Data rate / Total in Windows Properties looked nothing like Settings.
+    Minimized windows use the restore rect; live windows use the on-screen frame.
+    """
+    nx, ny, nw, nh = _normal_rect(hwnd)
+    if window_is_minimized(hwnd):
+        return nx, ny, nw, nh
+    cx, cy, cw, ch = current_frame_rect(hwnd)
+    if cw < 2 or ch < 2:
+        return nx, ny, nw, nh
+    if nw >= 200 and nh >= 80 and (cw < 160 or ch < 64):
+        return nx, ny, nw, nh
+    return cx, cy, cw, ch
 
 
 def _virtual_screen() -> WindowInfo:
