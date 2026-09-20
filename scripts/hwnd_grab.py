@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Grab BGRA frames from a specific HWND (PrintWindow / BitBlt).
 
-Never restores, cloaks, moves, or re-minimizes the target. The user keeps
-seeing the window and can minimize or maximize it while recording.
+Selected-window capture like 91806b1: PrintWindow of that HWND in place,
+letterboxed if the user maximizes. While the window is minimized, the
+session keeps DWM composing so this grabber still gets a bitmap.
 """
 
 from __future__ import annotations
@@ -20,15 +21,7 @@ gdi32 = ctypes.windll.gdi32
 SRCCOPY = 0x00CC0020
 DIB_RGB_COLORS = 0
 BI_RGB = 0
-PW_CLIENTONLY = 0x00000001
 PW_RENDERFULLCONTENT = 0x00000002
-WM_PRINT = 0x0317
-PRF_NONCLIENT = 0x00000002
-PRF_CLIENT = 0x00000004
-PRF_ERASEBKGND = 0x00000008
-PRF_CHILDREN = 0x00000010
-PRF_OWNED = 0x00000020
-WM_PRINT_FLAGS = PRF_CLIENT | PRF_NONCLIENT | PRF_CHILDREN | PRF_ERASEBKGND | PRF_OWNED
 
 gdi32.CreateCompatibleDC.restype = wintypes.HDC
 gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
@@ -68,7 +61,6 @@ user32.GetWindowDC.argtypes = [wintypes.HWND]
 user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
 user32.PrintWindow.argtypes = [wintypes.HWND, wintypes.HDC, wintypes.UINT]
 user32.PrintWindow.restype = wintypes.BOOL
-user32.SendMessageW.restype = wintypes.LPARAM
 
 
 class BITMAPINFOHEADER(ctypes.Structure):
@@ -148,28 +140,12 @@ class _Dib:
         return ctypes.string_at(self.bits.value, self.nbytes())
 
 
-def _paint_hwnd(hwnd: int, hdc: int, width: int, height: int) -> None:
-    """Paint hwnd into hdc. Tries PrintWindow / WM_PRINT even if minimized."""
-    if user32.PrintWindow(hwnd, hdc, PW_RENDERFULLCONTENT):
-        return
-    if user32.PrintWindow(hwnd, hdc, 0):
-        return
-    if user32.PrintWindow(hwnd, hdc, PW_CLIENTONLY):
-        return
-    user32.SendMessageW(hwnd, WM_PRINT, hdc, WM_PRINT_FLAGS)
-    hdc_win = user32.GetWindowDC(hwnd)
-    if hdc_win:
-        try:
-            gdi32.BitBlt(hdc, 0, 0, width, height, hdc_win, 0, 0, SRCCOPY)
-        finally:
-            user32.ReleaseDC(hwnd, hdc_win)
-
-
 def grab_hwnd_bgra(hwnd: int, out_w: int, out_h: int, *, letterbox: bool = False) -> bytes:
     """Return one BGRA frame of out_w x out_h from hwnd.
 
-    letterbox=True keeps aspect ratio when the user maximizes or resizes
-    (bars instead of stretching). Thumbs keep letterbox=False.
+    Same selected-window path as 91806b1: PrintWindow PW_RENDERFULLCONTENT
+    of that HWND (not a desktop crop). letterbox=True keeps aspect ratio
+    when the user maximizes or resizes.
     """
     if not user32.IsWindow(hwnd):
         raise RuntimeError("Window closed during capture")
@@ -186,7 +162,11 @@ def grab_hwnd_bgra(hwnd: int, out_w: int, out_h: int, *, letterbox: bool = False
     hdc_dst = gdi32.CreateCompatibleDC(hdc_win)
     try:
         src = _Dib(hdc_src, src_w, src_h)
-        _paint_hwnd(hwnd, hdc_src, src_w, src_h)
+        printed = user32.PrintWindow(hwnd, hdc_src, PW_RENDERFULLCONTENT)
+        if not printed:
+            printed = user32.PrintWindow(hwnd, hdc_src, 0)
+        if not printed:
+            gdi32.BitBlt(hdc_src, 0, 0, src_w, src_h, hdc_win, 0, 0, SRCCOPY)
         if src_w == out_w and src_h == out_h:
             data = src.to_bytes()
         else:

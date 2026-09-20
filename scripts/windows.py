@@ -6,16 +6,19 @@ cloaked on another virtual desktop, or uses class Chrome_WidgetWin_1.
 Geometry always comes from WINDOWPLACEMENT.rcNormalPosition so a minimized
 window still has a real size.
 
-Capture never restores, cloaks, moves, or re-minimizes the target HWND.
-The user keeps seeing the window and can minimize or maximize it at any time.
+Capture never sends the target to the back or off-screen. While the user
+minimizes it, DWM is asked to keep composing (cloak, no activate) so frames
+still exist; as soon as the user restores, maximizes, or focuses it, cloak
+is removed and the window is visible and fully under their control.
 """
 
 from __future__ import annotations
 
 import os
 import sys
+import time
 from ctypes import wintypes
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import ctypes
 
@@ -25,8 +28,16 @@ if sys.platform != "win32":
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 dwmapi = ctypes.windll.dwmapi
+dwmapi.DwmSetWindowAttribute.argtypes = [
+    wintypes.HWND,
+    ctypes.c_uint,
+    ctypes.c_void_p,
+    wintypes.DWORD,
+]
+dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
 
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+DWMWA_CLOAK = 13
 DWMWA_CLOAKED = 14
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
 GWL_EXSTYLE = -20
@@ -38,6 +49,15 @@ GA_ROOT = 2
 GA_ROOTOWNER = 3
 GW_HWNDNEXT = 2
 GW_CHILD = 5
+SW_SHOWNORMAL = 1
+SW_SHOWMINIMIZED = 2
+SW_SHOWNOACTIVATE = 4
+SW_RESTORE = 9
+SWP_NOSIZE = 0x0001
+SWP_NOMOVE = 0x0002
+SWP_NOZORDER = 0x0004
+SWP_NOACTIVATE = 0x0010
+SWP_SHOWWINDOW = 0x0040
 
 WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
@@ -106,6 +126,20 @@ user32.GetLastActivePopup.restype = wintypes.HWND
 user32.GetDesktopWindow.restype = wintypes.HWND
 user32.GetTopWindow.argtypes = [wintypes.HWND]
 user32.GetTopWindow.restype = wintypes.HWND
+user32.GetForegroundWindow.restype = wintypes.HWND
+user32.GetForegroundWindow.argtypes = []
+user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.ShowWindow.restype = wintypes.BOOL
+user32.SetWindowPos.argtypes = [
+    wintypes.HWND,
+    wintypes.HWND,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    ctypes.c_int,
+    wintypes.UINT,
+]
+user32.SetWindowPos.restype = wintypes.BOOL
 
 
 class WINDOWPLACEMENT(ctypes.Structure):
@@ -178,6 +212,115 @@ class WindowInfo:
         return f"{title}  -  {proc}  ({geo})"
 
 
+@dataclass
+class WindowRestore:
+    """Keep DWM pixels flowing while the user has minimized the target.
+
+    The HWND is never sent to the back or parked off-screen. Cloak is only
+    used while the window is iconic so PrintWindow still has a buffer; the
+    moment the user restores, maximizes, or focuses it, cloak is removed.
+    """
+
+    hwnd: int
+    was_minimized: bool
+    _placement: WINDOWPLACEMENT | None = field(default=None, repr=False)
+    _cloaked_by_us: bool = field(default=False, repr=False)
+    _user_minimized: bool = field(default=False, repr=False)
+    _kick_done: bool = field(default=False, repr=False)
+    _last_kick: float = field(default=0.0, repr=False)
+
+    @property
+    def capture_hidden(self) -> bool:
+        return bool(self._cloaked_by_us or self._user_minimized)
+
+    def ensure_composing(self) -> None:
+        hwnd = self.hwnd
+        if not hwnd or not user32.IsWindow(hwnd):
+            return
+        iconic = bool(user32.IsIconic(hwnd))
+        zoomed = bool(user32.IsZoomed(hwnd))
+        fg = int(user32.GetForegroundWindow() or 0)
+        root_fg = int(user32.GetAncestor(fg, GA_ROOT) or fg) if fg else 0
+        user_focused = fg == hwnd or root_fg == hwnd
+
+        if iconic:
+            self._user_minimized = True
+            now = time.monotonic()
+            if self._last_kick and now - self._last_kick < 0.35:
+                return
+            self._last_kick = now
+            self._compose_hidden()
+            return
+
+        if self._cloaked_by_us:
+            still_cloaked = _is_cloaked(hwnd)
+            settled = (time.monotonic() - self._last_kick) >= 0.4
+            if zoomed or not still_cloaked or (user_focused and settled):
+                _set_cloak(hwnd, False)
+                self._cloaked_by_us = False
+                self._user_minimized = False
+            return
+
+        self._user_minimized = False
+
+    def _unminimize_noactivate(self) -> bool:
+        """Take the HWND out of iconic state without stealing focus or z-order."""
+        hwnd = self.hwnd
+        if not user32.IsIconic(hwnd):
+            return True
+        user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
+        if not user32.IsIconic(hwnd):
+            return True
+        wp = _placement(hwnd)
+        if wp is not None:
+            wp.showCmd = SW_SHOWNOACTIVATE
+            user32.SetWindowPlacement(hwnd, ctypes.byref(wp))
+        if not user32.IsIconic(hwnd):
+            return True
+        # Chrome often ignores SW_SHOWNOACTIVATE while iconic.
+        user32.ShowWindow(hwnd, SW_RESTORE)
+        user32.SetWindowPos(
+            hwnd,
+            0,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW,
+        )
+        return not bool(user32.IsIconic(hwnd))
+
+    def _compose_hidden(self) -> None:
+        hwnd = self.hwnd
+        if not self._unminimize_noactivate():
+            return
+        _set_cloak(hwnd, True)
+        self._cloaked_by_us = _is_cloaked(hwnd)
+        if not self._kick_done:
+            time.sleep(0.15)
+            user32.RedrawWindow(hwnd, None, None, 0x0103)
+            try:
+                dwmapi.DwmFlush()
+            except OSError:
+                pass
+            self._kick_done = True
+        else:
+            user32.RedrawWindow(hwnd, None, None, 0x0103)
+
+    def revert(self) -> None:
+        if not user32.IsWindow(self.hwnd):
+            return
+        hwnd = self.hwnd
+        if self._cloaked_by_us:
+            _set_cloak(hwnd, False)
+            self._cloaked_by_us = False
+        if self._user_minimized:
+            if self._placement is not None:
+                user32.SetWindowPlacement(hwnd, ctypes.byref(self._placement))
+            else:
+                user32.ShowWindow(hwnd, SW_SHOWMINIMIZED)
+
+
 def _window_title(hwnd: int) -> str:
     n = user32.GetWindowTextLengthW(hwnd)
     if n <= 0:
@@ -203,6 +346,20 @@ def _is_cloaked(hwnd: int) -> bool:
             ctypes.sizeof(cloaked),
         )
         return hr == 0 and cloaked.value != 0
+    except OSError:
+        return False
+
+
+def _set_cloak(hwnd: int, cloak: bool) -> bool:
+    val = wintypes.BOOL(1 if cloak else 0)
+    try:
+        hr = dwmapi.DwmSetWindowAttribute(
+            wintypes.HWND(hwnd),
+            DWMWA_CLOAK,
+            ctypes.byref(val),
+            ctypes.sizeof(val),
+        )
+        return hr == 0
     except OSError:
         return False
 
@@ -509,6 +666,25 @@ def window_is_minimized(hwnd: int) -> bool:
 
 def window_is_maximized(hwnd: int) -> bool:
     return bool(hwnd) and bool(user32.IsWindow(hwnd)) and bool(user32.IsZoomed(hwnd))
+
+
+def prepare_for_capture(info: WindowInfo) -> WindowRestore:
+    """If the target is minimized, start composing without activating it."""
+    token = WindowRestore(hwnd=info.hwnd, was_minimized=False)
+    if info.is_desktop or not info.hwnd:
+        return token
+    hwnd = info.hwnd
+    if not user32.IsWindow(hwnd):
+        raise RuntimeError("That window no longer exists.")
+    wp = _placement(hwnd)
+    token._placement = wp
+    token.was_minimized = bool(user32.IsIconic(hwnd)) or (
+        wp is not None and wp.showCmd == SW_SHOWMINIMIZED
+    )
+    token._user_minimized = token.was_minimized
+    if token.was_minimized:
+        token.ensure_composing()
+    return token
 
 
 user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
