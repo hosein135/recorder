@@ -34,8 +34,25 @@ function Refresh-SessionPath {
     $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
                 [System.Environment]::GetEnvironmentVariable("Path", "User")
 
+    foreach ($dir in @(
+        "$env:LOCALAPPDATA\Microsoft\WindowsApps",
+        "$env:LOCALAPPDATA\Microsoft\WinGet\Links"
+    )) {
+        if ((Test-Path $dir) -and ($env:Path -notlike "*$dir*")) {
+            $env:Path = "$dir;$env:Path"
+        }
+    }
+
+    $appInstaller = Get-ChildItem "$env:ProgramFiles\WindowsApps" -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -like "Microsoft.DesktopAppInstaller_*" } |
+        Sort-Object Name -Descending |
+        Select-Object -First 1
+    if ($appInstaller -and (Test-Path (Join-Path $appInstaller.FullName "winget.exe")) -and ($env:Path -notlike "*$($appInstaller.FullName)*")) {
+        $env:Path = "$($appInstaller.FullName);$env:Path"
+    }
+
     if ($WingetPackagesRoot -and (Test-Path $WingetPackagesRoot)) {
-        foreach ($exeName in @("vfox.exe", "ffmpeg.exe", "mpc-hc64.exe", "mpc-hc.exe")) {
+        foreach ($exeName in @("vfox.exe", "ffmpeg.exe", "mpc-hc64.exe", "mpc-hc.exe", "winget.exe")) {
             $exe = Get-ChildItem -Path $WingetPackagesRoot -Recurse -Filter $exeName -ErrorAction SilentlyContinue |
                 Select-Object -First 1
             if ($exe -and ($env:Path -notlike "*$($exe.DirectoryName)*")) {
@@ -76,6 +93,21 @@ function Refresh-SessionPath {
     }
 }
 
+function Add-DirToMachinePath {
+    param([Parameter(Mandatory = $true)][string]$BinDir)
+
+    if (-not $BinDir -or -not (Test-Path $BinDir)) { return $false }
+    $machinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+    if ($machinePath -like "*$BinDir*") {
+        if ($env:Path -notlike "*$BinDir*") { $env:Path = "$BinDir;$env:Path" }
+        return $true
+    }
+    [System.Environment]::SetEnvironmentVariable("Path", "$BinDir;$machinePath", "Machine")
+    if ($env:Path -notlike "*$BinDir*") { $env:Path = "$BinDir;$env:Path" }
+    Write-Host "  Added $BinDir to system PATH (permanent)" -ForegroundColor Green
+    return $true
+}
+
 function Add-VfoxSdkToMachinePath {
     param([Parameter(Mandatory = $true)][string]$ExeName)
 
@@ -97,17 +129,116 @@ function Add-VfoxSdkToMachinePath {
         Write-Host "  WARNING: $ExeName not found on PATH or in vfox SDK directories." -ForegroundColor Yellow
         return $false
     }
+    return (Add-DirToMachinePath -BinDir $binDir)
+}
 
-    $machinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
-    if ($machinePath -like "*$binDir*") {
-        if ($env:Path -notlike "*$binDir*") { $env:Path = "$binDir;$env:Path" }
-        return $true
+function Test-UsableExe {
+    param([string]$Path)
+    if (-not $Path -or -not (Test-Path $Path)) { return $false }
+    try {
+        return ((Get-Item $Path).Length -gt 0)
+    } catch {
+        return $false
+    }
+}
+
+function Find-WingetExe {
+    $cmd = Get-Command winget -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source -and (Test-Path $cmd.Source)) {
+        return $cmd.Source
     }
 
-    [System.Environment]::SetEnvironmentVariable("Path", "$binDir;$machinePath", "Machine")
-    if ($env:Path -notlike "*$binDir*") { $env:Path = "$binDir;$env:Path" }
-    Write-Host "  Added $binDir to system PATH (permanent)" -ForegroundColor Green
-    return $true
+    foreach ($p in @(
+        "$env:LOCALAPPDATA\Microsoft\WinGet\Links\winget.exe",
+        "$env:LOCALAPPDATA\Microsoft\WindowsApps\winget.exe"
+    )) {
+        if (Test-UsableExe $p) { return $p }
+    }
+
+    $pkg = Get-AppxPackage -Name Microsoft.DesktopAppInstaller -ErrorAction SilentlyContinue |
+        Sort-Object Version -Descending |
+        Select-Object -First 1
+    if (-not $pkg) {
+        $pkg = Get-AppxPackage -AllUsers -Name Microsoft.DesktopAppInstaller -ErrorAction SilentlyContinue |
+            Sort-Object Version -Descending |
+            Select-Object -First 1
+    }
+    if ($pkg -and $pkg.InstallLocation) {
+        $pkgExe = Join-Path $pkg.InstallLocation "winget.exe"
+        if (Test-UsableExe $pkgExe) { return $pkgExe }
+    }
+
+    $appsRoot = Join-Path $env:ProgramFiles "WindowsApps"
+    if (Test-Path $appsRoot) {
+        $exe = Get-ChildItem -LiteralPath $appsRoot -Filter "winget.exe" -Recurse -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+        if ($exe -and (Test-UsableExe $exe.FullName)) { return $exe.FullName }
+    }
+    return $null
+}
+
+function Add-WingetToPath {
+    param([string]$WingetExe)
+    if (-not $WingetExe) { return $false }
+    $ok = Add-DirToMachinePath -BinDir (Split-Path $WingetExe -Parent)
+    foreach ($dir in @(
+        "$env:LOCALAPPDATA\Microsoft\WindowsApps",
+        "$env:LOCALAPPDATA\Microsoft\WinGet\Links"
+    )) {
+        if (Test-Path $dir) { Add-DirToMachinePath -BinDir $dir | Out-Null }
+    }
+    return $ok
+}
+
+function Ensure-Winget {
+    Refresh-SessionPath
+
+    $exe = Find-WingetExe
+    if ($exe) {
+        Write-Host "WinGet is already installed; skipping download." -ForegroundColor Green
+        Write-Host "  $exe" -ForegroundColor DarkGray
+        Add-WingetToPath -WingetExe $exe | Out-Null
+        Refresh-SessionPath
+        if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+            throw "WinGet is installed but not on PATH after update. Open a new admin PowerShell and re-run."
+        }
+        return
+    }
+
+    $pkg = Get-AppxPackage -Name Microsoft.DesktopAppInstaller -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($pkg -and $pkg.InstallLocation -and (Test-Path (Join-Path $pkg.InstallLocation "winget.exe"))) {
+        $pkgExe = Join-Path $pkg.InstallLocation "winget.exe"
+        Write-Host "App Installer is already installed; skipping download and adding winget to PATH." -ForegroundColor Green
+        Add-WingetToPath -WingetExe $pkgExe | Out-Null
+        Refresh-SessionPath
+        return
+    }
+
+    Write-Host "WinGet not found. Installing WinGet (App Installer)..." -ForegroundColor Yellow
+    $installerPath = Join-Path $env:TEMP "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle"
+    $haveBundle = (Test-Path $installerPath) -and ((Get-Item $installerPath).Length -gt 1MB)
+    if ($haveBundle) {
+        Write-Host "  Using already-downloaded installer (skip redownload)." -ForegroundColor Green
+    } else {
+        $downloaded = Download-File -Url "https://aka.ms/getwinget" -Destination $installerPath -Label "Downloading WinGet (App Installer)"
+        if (-not $downloaded) { throw "Failed to download WinGet." }
+    }
+    Add-AppxPackage -Path $installerPath
+    Write-Host "WinGet installed successfully." -ForegroundColor Green
+
+    Start-Sleep -Seconds 2
+    Refresh-SessionPath
+    $exe = Find-WingetExe
+    if (-not $exe) {
+        throw "WinGet installed but winget.exe was not found. Open a new admin PowerShell and re-run."
+    }
+    Add-WingetToPath -WingetExe $exe | Out-Null
+    Refresh-SessionPath
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        throw "WinGet installed but is not on PATH. Open a new admin PowerShell and re-run."
+    }
 }
 
 function Invoke-Vfox {
@@ -416,17 +547,7 @@ function Find-MpcHc {
 
 ## 1. INSTALL WINGET
 Write-Section "Bootstrap: WinGet"
-if (!(Get-Command winget -ErrorAction SilentlyContinue)) {
-    Write-Host "WinGet not found. Installing WinGet and App Installer dependencies..." -ForegroundColor Yellow
-    $installerPath = "$env:TEMP\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe.msixbundle"
-    $downloaded = Download-File -Url "https://aka.ms/getwinget" -Destination $installerPath -Label "Downloading WinGet (App Installer)"
-    if (-not $downloaded) { throw "Failed to download WinGet." }
-    Add-AppxPackage -Path $installerPath
-    Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
-    Write-Host "WinGet installed successfully." -ForegroundColor Green
-} else {
-    Write-Host "WinGet is already installed." -ForegroundColor Green
-}
+Ensure-Winget
 
 ## 2. PATH REFRESH
 $wingetPackagesRoot = "$env:LOCALAPPDATA\Microsoft\WinGet\Packages"

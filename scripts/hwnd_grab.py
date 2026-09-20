@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Grab BGRA frames from a specific HWND (PrintWindow / BitBlt / DWM).
+"""Grab BGRA frames from a specific HWND (PrintWindow / BitBlt).
 
-Same idea as Mirillis Action! Window / Selected application mode: capture
-that window in place. The HWND is never restored, cloaked, moved, or
-forced on top — the user can still see it, minimize it, and maximize it.
-Minimized windows keep recording at restore size (not the 146x20 ghost rect).
+The capture session restores a minimized HWND (without activating it) and
+DWM-cloaks it so PrintWindow still has pixels. This grabber only paints
+frames; it does not change the target's min/max/z-order itself.
 """
 
 from __future__ import annotations
