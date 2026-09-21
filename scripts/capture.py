@@ -42,7 +42,7 @@ OPUS_SAMPLE_RATES = (8000, 12000, 16000, 24000, 48000)
 
 # Output height presets. Width follows the window so the picture stays in proportion.
 VIDEO_PRESETS = ("144p", "240p", "360p", "480p")
-DEFAULT_VIDEO_PRESET = "240p"
+DEFAULT_VIDEO_PRESET = "480p"
 VIDEO_PRESET_HEIGHT = {"144p": 144, "240p": 240, "360p": 360, "480p": 480}
 
 # 100 is the sharpest (largest). 0 is the smallest file. Below the floor, UI text smears.

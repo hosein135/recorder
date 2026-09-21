@@ -65,20 +65,26 @@ from hw_detect import HardwareProfile, detect
 from player import find_mpc_hc, format_size, list_recordings, play_with_mpc
 from windows import WindowInfo, cursor_pos, escape_pressed, left_button_down, list_windows, window_at_point
 
-BG = "#12141a"
-PANEL = "#1c2029"
-PANEL2 = "#252a36"
-FG = "#f1f3f7"
-MUTED = "#8b93a7"
-ACCENT = "#4c8dff"
-ACCENT_DIM = "#2a4f8a"
-RECORD = "#e5484d"
-RECORD_DIM = "#8f2d32"
-OK = "#3dd68c"
-BORDER = "#343b4a"
-WARN = "#f0c14b"
-CHIP_BG = "#171b24"
-CHIP_WARN_BG = "#3a3218"
+BG = "#f3f5f8"
+PANEL = "#ffffff"
+PANEL2 = "#f6f8fb"
+FG = "#1c2434"
+MUTED = "#5e6a80"
+ACCENT = "#315efb"
+ACCENT_HOVER = "#2348d6"
+ACCENT_DIM = "#e7edff"
+RECORD = "#e11d48"
+RECORD_HOVER = "#be123c"
+RECORD_DIM = "#fecdd6"
+OK = "#0f9f6e"
+OK_BG = "#e5f7ef"
+BORDER = "#e1e6ef"
+WARN = "#b45309"
+CHIP_BG = "#eef2f7"
+CHIP_WARN_BG = "#fff6db"
+ON_COLOR = "#ffffff"
+PAUSED_BG = "#fff4d4"
+PAUSED_FG = "#8a5a00"
 
 
 class RecorderApp(tk.Tk):
@@ -96,6 +102,7 @@ class RecorderApp(tk.Tk):
         self.loopbacks: list[AudioDevice] = []
         self.session: CaptureSession | None = None
         self._tick_job: str | None = None
+        self._timer_hold = False
         self.output_dir = _ROOT / "recordings"
         self._rec_by_id: dict[str, Path] = {}
         self._min_labels: dict[str, tk.Label] = {}
@@ -140,7 +147,7 @@ class RecorderApp(tk.Tk):
         outer.pack(fill="x", pady=(0, 14))
         body = tk.Frame(outer, bg=PANEL)
         body.pack(fill="x", padx=16, pady=14)
-        ttk.Label(body, text=title.upper(), style="Section.TLabel").pack(anchor="w", pady=(0, 10))
+        ttk.Label(body, text=title, style="Section.TLabel").pack(anchor="w", pady=(0, 12))
         return body
 
     def _add_setting_row(
@@ -213,39 +220,123 @@ class RecorderApp(tk.Tk):
         style.configure("Hint.TLabel", background=BG, foreground=MUTED, font=("Segoe UI", 8))
         style.configure("Panel.TLabel", background=PANEL, foreground=FG)
         style.configure("Side.TFrame", background=PANEL)
-        style.configure("Section.TLabel", background=PANEL, foreground=MUTED, font=("Segoe UI Semibold", 8))
+        style.configure("Section.TLabel", background=PANEL, foreground=FG, font=("Segoe UI Semibold", 13))
         style.configure("Side.TLabel", background=PANEL, foreground=MUTED, font=("Segoe UI", 9))
-        style.configure("Side.TRadiobutton", background=PANEL2, foreground=FG, font=("Segoe UI", 10), padding=2)
-        style.map("Side.TRadiobutton", background=[("active", PANEL2)], foreground=[("selected", ACCENT)])
-        style.configure("Title.TLabel", background=BG, foreground=FG, font=("Segoe UI Semibold", 18))
-        style.configure("Timer.TLabel", background=BG, foreground=FG, font=("Cascadia Mono", 20, "bold"))
-        style.configure("Badge.TLabel", background=PANEL2, foreground=MUTED, font=("Segoe UI", 8), padding=(8, 3))
-        style.configure("Live.TLabel", background=RECORD, foreground="#fff", font=("Segoe UI Semibold", 8), padding=(8, 3))
-        style.configure("Ready.TLabel", background=PANEL2, foreground=OK, font=("Segoe UI Semibold", 8), padding=(8, 3))
-        style.configure("Paused.TLabel", background="#6b5420", foreground="#fff", font=("Segoe UI Semibold", 8), padding=(8, 3))
+        style.configure("Side.TRadiobutton", background=PANEL2, foreground=FG, font=("Segoe UI", 10), padding=(8, 4))
+        style.map(
+            "Side.TRadiobutton",
+            background=[("active", PANEL2)],
+            foreground=[("selected", ACCENT), ("active", ACCENT)],
+        )
+        style.configure("Title.TLabel", background=BG, foreground=FG, font=("Segoe UI Semibold", 22))
+        style.configure("Timer.TLabel", background=BG, foreground=FG, font=("Consolas", 22))
+        style.configure("Badge.TLabel", background=ACCENT_DIM, foreground=ACCENT, font=("Segoe UI Semibold", 9), padding=(10, 4))
+        style.configure("Live.TLabel", background=RECORD, foreground=ON_COLOR, font=("Segoe UI Semibold", 9), padding=(10, 4))
+        style.configure("Ready.TLabel", background=OK_BG, foreground=OK, font=("Segoe UI Semibold", 9), padding=(10, 4))
+        style.configure("Paused.TLabel", background=PAUSED_BG, foreground=PAUSED_FG, font=("Segoe UI Semibold", 9), padding=(10, 4))
         style.configure("Field.TLabel", background=BG, foreground=MUTED, font=("Segoe UI", 9), width=12)
-        style.configure("TRadiobutton", background=BG, foreground=FG, font=("Segoe UI", 10), padding=2)
+        style.configure("TRadiobutton", background=BG, foreground=FG, font=("Segoe UI", 10), padding=(6, 4))
         style.map("TRadiobutton", background=[("active", BG)], foreground=[("selected", ACCENT)])
-        style.configure("TButton", font=("Segoe UI", 10), padding=(10, 6), background=PANEL2, foreground=FG)
-        style.map("TButton", background=[("active", ACCENT_DIM), ("pressed", ACCENT)], foreground=[("active", "#fff")])
-        style.configure("Ghost.TButton", font=("Segoe UI", 9), padding=(8, 5), background=PANEL2, foreground=FG)
-        style.configure("Accent.TButton", font=("Segoe UI Semibold", 10), padding=(14, 7), background=ACCENT, foreground="#fff")
-        style.map("Accent.TButton", background=[("active", "#6aa1ff"), ("disabled", BORDER)])
-        style.configure("Record.TButton", font=("Segoe UI Semibold", 12), padding=(18, 10), background=RECORD, foreground="#fff")
-        style.map("Record.TButton", background=[("!disabled", RECORD), ("active", "#ff6b6f"), ("disabled", RECORD_DIM)])
-        style.configure("Stop.TButton", font=("Segoe UI Semibold", 12), padding=(18, 10), background="#c43c40", foreground="#fff")
-        style.configure("TCombobox", fieldbackground=PANEL, background=PANEL, foreground=FG, arrowcolor=FG)
+        style.configure(
+            "TButton",
+            font=("Segoe UI", 10),
+            padding=(12, 8),
+            background=PANEL,
+            foreground=FG,
+            bordercolor=BORDER,
+            lightcolor=BORDER,
+            darkcolor=BORDER,
+            relief="flat",
+            borderwidth=1,
+        )
+        style.map(
+            "TButton",
+            background=[("active", ACCENT_DIM), ("pressed", ACCENT_DIM), ("disabled", PANEL2)],
+            foreground=[("disabled", MUTED)],
+        )
+        style.configure(
+            "Ghost.TButton",
+            font=("Segoe UI", 10),
+            padding=(12, 8),
+            background=PANEL,
+            foreground=FG,
+            bordercolor=BORDER,
+            lightcolor=BORDER,
+            darkcolor=BORDER,
+            relief="flat",
+        )
+        style.map(
+            "Ghost.TButton",
+            background=[("active", ACCENT_DIM), ("pressed", ACCENT_DIM), ("disabled", PANEL2)],
+            foreground=[("disabled", MUTED)],
+        )
+        style.configure(
+            "Accent.TButton",
+            font=("Segoe UI Semibold", 10),
+            padding=(16, 8),
+            background=ACCENT,
+            foreground=ON_COLOR,
+            bordercolor=ACCENT,
+            lightcolor=ACCENT,
+            darkcolor=ACCENT,
+            relief="flat",
+        )
+        style.map(
+            "Accent.TButton",
+            background=[("active", ACCENT_HOVER), ("pressed", ACCENT_HOVER), ("disabled", BORDER)],
+            foreground=[("disabled", MUTED), ("!disabled", ON_COLOR)],
+            bordercolor=[("active", ACCENT_HOVER), ("disabled", BORDER)],
+        )
+        style.configure(
+            "Record.TButton",
+            font=("Segoe UI Semibold", 12),
+            padding=(18, 12),
+            background=RECORD,
+            foreground=ON_COLOR,
+            bordercolor=RECORD,
+            lightcolor=RECORD,
+            darkcolor=RECORD,
+            relief="flat",
+        )
+        style.map(
+            "Record.TButton",
+            background=[("!disabled", RECORD), ("active", RECORD_HOVER), ("disabled", RECORD_DIM)],
+            foreground=[("disabled", MUTED), ("!disabled", ON_COLOR)],
+        )
+        style.configure(
+            "Stop.TButton",
+            font=("Segoe UI Semibold", 12),
+            padding=(18, 12),
+            background=RECORD_HOVER,
+            foreground=ON_COLOR,
+            bordercolor=RECORD_HOVER,
+            lightcolor=RECORD_HOVER,
+            darkcolor=RECORD_HOVER,
+            relief="flat",
+        )
+        style.map("Stop.TButton", background=[("disabled", RECORD_DIM)], foreground=[("disabled", MUTED)])
+        style.configure(
+            "TEntry",
+            fieldbackground=PANEL,
+            foreground=FG,
+            bordercolor=BORDER,
+            lightcolor=BORDER,
+            darkcolor=BORDER,
+            padding=6,
+        )
+        style.map("TEntry", bordercolor=[("focus", ACCENT)], lightcolor=[("focus", ACCENT)], darkcolor=[("focus", ACCENT)])
+        style.configure("TCombobox", fieldbackground=PANEL, background=PANEL, foreground=FG, arrowcolor=MUTED, padding=4)
         style.map(
             "TCombobox",
             fieldbackground=[("readonly", PANEL), ("disabled", PANEL2)],
             foreground=[("readonly", FG), ("disabled", MUTED)],
-            selectbackground=[("readonly", ACCENT)],
-            selectforeground=[("readonly", "#fff")],
+            selectbackground=[("readonly", ACCENT_DIM)],
+            selectforeground=[("readonly", FG)],
         )
-        style.configure("TSpinbox", fieldbackground=PANEL, background=PANEL, foreground=FG, arrowcolor=FG)
+        style.configure("TSpinbox", fieldbackground=PANEL, background=PANEL, foreground=FG, arrowcolor=MUTED, padding=4)
         style.map("TSpinbox", fieldbackground=[("!disabled", PANEL)], foreground=[("!disabled", FG)])
-        style.configure("TLabelframe", background=BG, foreground=FG, bordercolor=BORDER, relief="flat")
-        style.configure("TLabelframe.Label", background=BG, foreground=MUTED, font=("Segoe UI Semibold", 9))
+        style.configure("TLabelframe", background=BG, foreground=FG, bordercolor=BORDER, relief="solid", borderwidth=1)
+        style.configure("TLabelframe.Label", background=BG, foreground=FG, font=("Segoe UI Semibold", 11))
         style.configure(
             "Treeview",
             background=PANEL,
@@ -263,9 +354,14 @@ class RecorderApp(tk.Tk):
             relief="flat",
             padding=(6, 8),
         )
-        style.map("Treeview", background=[("selected", ACCENT)], foreground=[("selected", "#fff")])
-        style.map("Treeview.Heading", background=[("active", ACCENT_DIM)])
+        style.map("Treeview", background=[("selected", ACCENT_DIM)], foreground=[("selected", FG)])
+        style.map("Treeview.Heading", background=[("active", ACCENT_DIM)], foreground=[("active", FG)])
         style.configure("TScrollbar", background=PANEL2, troughcolor=BG, bordercolor=BG, arrowcolor=MUTED)
+        self.option_add("*TCombobox*Listbox.background", PANEL)
+        self.option_add("*TCombobox*Listbox.foreground", FG)
+        self.option_add("*TCombobox*Listbox.selectBackground", ACCENT_DIM)
+        self.option_add("*TCombobox*Listbox.selectForeground", FG)
+        self.option_add("*TCombobox*Listbox.font", "Segoe UI 10")
         style.configure("Horizontal.TProgressbar", background=ACCENT, troughcolor=PANEL2)
 
     def _build(self) -> None:
@@ -384,8 +480,10 @@ class RecorderApp(tk.Tk):
             bg=PANEL,
             fg=FG,
             relief="flat",
-            highlightthickness=0,
-            font=("Cascadia Mono", 9),
+            font=("Consolas", 9),
+            highlightbackground=BORDER,
+            highlightcolor=ACCENT,
+            highlightthickness=1,
             wrap="word",
             insertbackground=FG,
             padx=8,
@@ -1036,7 +1134,7 @@ class RecorderApp(tk.Tk):
             banner,
             text="  Click the window to record    Esc cancels  ",
             background=ACCENT,
-            foreground="#fff",
+            foreground=ON_COLOR,
             font=("Segoe UI Semibold", 12),
         ).pack(padx=10, pady=10)
         banner.update_idletasks()
@@ -1151,9 +1249,20 @@ class RecorderApp(tk.Tk):
                 return item
         return items[0] if items else None
 
+    def _stop_timer(self) -> None:
+        self._timer_hold = True
+        if self._tick_job:
+            try:
+                self.after_cancel(self._tick_job)
+            except tk.TclError:
+                pass
+            self._tick_job = None
+
     def toggle_record(self) -> None:
         if self.session:
-            self.record_btn.configure(state="disabled")
+            self._stop_timer()
+            self.record_btn.configure(state="disabled", text="■   Saving")
+            self.pause_btn.configure(state="disabled")
             threading.Thread(target=self._stop_worker, daemon=True).start()
             return
         self._start_record()
@@ -1247,6 +1356,8 @@ class RecorderApp(tk.Tk):
             self.win_list.configure(selectmode="none")
         except tk.TclError:
             pass
+        self._timer_hold = False
+        self.time_label.configure(text="00:00:00")
         self._tick()
         self._log(
             f"Recording {window.label()} @ {fps} fps, {preset}, quality {quality}, "
@@ -1254,8 +1365,7 @@ class RecorderApp(tk.Tk):
         )
 
     def _tick(self) -> None:
-        if not self.session:
-            self.time_label.configure(text="00:00:00")
+        if self._timer_hold or not self.session:
             return
         sec = int(self.session.elapsed())
         h, rem = divmod(sec, 3600)
@@ -1287,7 +1397,6 @@ class RecorderApp(tk.Tk):
         self.session = None
         self.record_btn.configure(text="●   Record    F9", style="Record.TButton", state="normal")
         self.pause_btn.configure(state="disabled", text="Pause")
-        self.time_label.configure(text="00:00:00")
         self._set_live_badge("ready")
         try:
             self.win_list.configure(selectmode="browse")
