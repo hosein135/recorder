@@ -1,5 +1,4 @@
-﻿#Requires -RunAsAdministrator
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 
 # Bootstrap + hardware-aware H.266/VVC window recorder.
 # Patterns from ../animation1/run.ps1:
@@ -102,9 +101,18 @@ function Add-DirToMachinePath {
         if ($env:Path -notlike "*$BinDir*") { $env:Path = "$BinDir;$env:Path" }
         return $true
     }
-    [System.Environment]::SetEnvironmentVariable("Path", "$BinDir;$machinePath", "Machine")
+    try {
+        [System.Environment]::SetEnvironmentVariable("Path", "$BinDir;$machinePath", "Machine")
+        Write-Host "  Added $BinDir to system PATH (permanent)" -ForegroundColor Green
+    } catch {
+        $userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
+        if ($userPath -notlike "*$BinDir*") {
+            $joined = if ($userPath) { "$BinDir;$userPath" } else { $BinDir }
+            [System.Environment]::SetEnvironmentVariable("Path", $joined, "User")
+        }
+        Write-Host "  Added $BinDir to your user PATH." -ForegroundColor Yellow
+    }
     if ($env:Path -notlike "*$BinDir*") { $env:Path = "$BinDir;$env:Path" }
-    Write-Host "  Added $BinDir to system PATH (permanent)" -ForegroundColor Green
     return $true
 }
 
