@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tkinter GUI: pick a window, FPS, internal/mic/both audio, record H.266/VVC."""
+"""Tkinter GUI: pick a window, FPS, 144p/240p/480p, audio, record H.266/VVC."""
 
 from __future__ import annotations
 
@@ -40,25 +40,19 @@ from capture import (
     DEFAULT_AUDIO_KBPS,
     DEFAULT_FPS,
     DEFAULT_SAMPLE_KHZ,
-    DEFAULT_TOTAL_KBPS,
-    DEFAULT_VIDEO_KBPS,
+    DEFAULT_VIDEO_PRESET,
     MIN_USEFUL_AUDIO_KBPS,
     MIN_USEFUL_SAMPLE_KHZ,
-    MIN_USEFUL_TOTAL_KBPS,
-    MIN_USEFUL_VIDEO_KBPS,
     RecordConfig,
     RecorderError,
     SAMPLE_KHZ_MAX,
     SAMPLE_KHZ_MIN,
-    TOTAL_KBPS_MAX,
-    TOTAL_KBPS_MIN,
-    VIDEO_KBPS_MAX,
-    VIDEO_KBPS_MIN,
+    VIDEO_PRESETS,
     clamp_audio_kbps,
     clamp_sample_rate,
-    clamp_video_kbps,
     default_output_path,
     probe_summary,
+    resolve_video_preset,
     sample_khz_to_hz,
     snap_opus_rate,
 )
@@ -100,11 +94,9 @@ class RecorderApp(tk.Tk):
         self._tick_job: str | None = None
         self.output_dir = _ROOT / "recordings"
         self._rec_by_id: dict[str, Path] = {}
-        self._syncing_rates = False
         self._min_labels: dict[str, tk.Label] = {}
         self._min_floors: dict[str, int] = {}
         self._setting_spins: dict[str, tuple[ttk.Spinbox, tk.StringVar]] = {}
-        self._rate_source = "av"
 
         self._style()
         self._build()
@@ -490,16 +482,29 @@ class RecorderApp(tk.Tk):
         self.fps_var = tk.StringVar(value=str(DEFAULT_FPS))
         self.audio_kbps_var = tk.StringVar(value=str(DEFAULT_AUDIO_KBPS))
         self.sample_rate_var = tk.StringVar(value=str(DEFAULT_SAMPLE_KHZ))
-        self.video_kbps_var = tk.StringVar(value=str(DEFAULT_VIDEO_KBPS))
-        self.total_kbps_var = tk.StringVar(value=str(DEFAULT_TOTAL_KBPS))
+        self.resolution_var = tk.StringVar(value=DEFAULT_VIDEO_PRESET)
 
         self._add_setting_row(grid, 0, "FPS", self.fps_var, 1, 240, 1, 1, "fps", "fps")
-        self._add_setting_row(
-            grid, 1, "Data rate", self.video_kbps_var, VIDEO_KBPS_MIN, VIDEO_KBPS_MAX, 100, MIN_USEFUL_VIDEO_KBPS, "video", "kb/s"
-        )
-        self._add_setting_row(
-            grid, 2, "Total", self.total_kbps_var, TOTAL_KBPS_MIN, TOTAL_KBPS_MAX, 100, MIN_USEFUL_TOTAL_KBPS, "total", "kb/s"
-        )
+
+        res_row = tk.Frame(grid, bg=PANEL2)
+        res_row.grid(row=1, column=0, sticky="ew", pady=3)
+        tk.Label(
+            res_row,
+            text="Resolution",
+            bg=PANEL2,
+            fg=MUTED,
+            font=("Segoe UI", 9),
+            width=12,
+            anchor="w",
+        ).pack(side="left", padx=(10, 4), pady=8)
+        for value in VIDEO_PRESETS:
+            ttk.Radiobutton(
+                res_row,
+                text=value,
+                value=value,
+                variable=self.resolution_var,
+                style="Side.TRadiobutton",
+            ).pack(side="left", padx=8, pady=8)
 
         audio = self._card(right, "Audio")
         agrid = tk.Frame(audio, bg=PANEL)
@@ -567,11 +572,8 @@ class RecorderApp(tk.Tk):
             side="left", padx=(0, 10), pady=8
         )
 
-        self._syncing_rates = False
-        self.audio_kbps_var.trace_add("write", lambda *_: self._on_audio_or_video_rate())
+        self.audio_kbps_var.trace_add("write", lambda *_: self._refresh_quality_hints())
         self.sample_rate_var.trace_add("write", lambda *_: self._refresh_quality_hints())
-        self.video_kbps_var.trace_add("write", lambda *_: self._on_audio_or_video_rate())
-        self.total_kbps_var.trace_add("write", lambda *_: self._on_total_rate())
         self.fps_var.trace_add("write", lambda *_: self._refresh_quality_hints())
 
         self._bind_sidebar_scroll(canvas, inner)
@@ -760,40 +762,11 @@ class RecorderApp(tk.Tk):
         except ValueError:
             return fallback
 
-    def _on_audio_or_video_rate(self) -> None:
-        if self._syncing_rates:
-            return
-        self._rate_source = "av"
-        self._syncing_rates = True
-        try:
-            audio = self._parse_int(self.audio_kbps_var, DEFAULT_AUDIO_KBPS)
-            video = self._parse_int(self.video_kbps_var, DEFAULT_VIDEO_KBPS)
-            self.total_kbps_var.set(str(audio + video))
-        finally:
-            self._syncing_rates = False
-        self._refresh_quality_hints()
-
-    def _on_total_rate(self) -> None:
-        if self._syncing_rates:
-            return
-        self._rate_source = "total"
-        self._syncing_rates = True
-        try:
-            audio = self._parse_int(self.audio_kbps_var, DEFAULT_AUDIO_KBPS)
-            total = self._parse_int(self.total_kbps_var, DEFAULT_TOTAL_KBPS)
-            video = max(VIDEO_KBPS_MIN, total - audio)
-            self.video_kbps_var.set(str(video))
-        finally:
-            self._syncing_rates = False
-        self._refresh_quality_hints()
-
     def _refresh_quality_hints(self) -> None:
         checks: list[tuple[str, tk.StringVar, int]] = [
             ("fps", self.fps_var, 1),
             ("audio", self.audio_kbps_var, DEFAULT_AUDIO_KBPS),
             ("sample", self.sample_rate_var, DEFAULT_SAMPLE_KHZ),
-            ("video", self.video_kbps_var, DEFAULT_VIDEO_KBPS),
-            ("total", self.total_kbps_var, DEFAULT_TOTAL_KBPS),
         ]
         for key, var, fallback in checks:
             lbl = self._min_labels.get(key)
@@ -814,19 +787,12 @@ class RecorderApp(tk.Tk):
         except tk.TclError:
             pass
         self.update_idletasks()
-        self._syncing_rates = True
-        try:
-            for spin, var in self._setting_spins.values():
-                try:
-                    var.set(str(spin.get()).strip())
-                except tk.TclError:
-                    pass
-        finally:
-            self._syncing_rates = False
-        if self._rate_source == "total":
-            self._on_total_rate()
-        else:
-            self._on_audio_or_video_rate()
+        for spin, var in self._setting_spins.values():
+            try:
+                var.set(str(spin.get()).strip())
+            except tk.TclError:
+                pass
+        self._refresh_quality_hints()
 
     def _read_int_setting(
         self,
@@ -849,7 +815,7 @@ class RecorderApp(tk.Tk):
             return None
         return n
 
-    def _read_rate_settings(self) -> tuple[int, int, int, int] | None:
+    def _read_rate_settings(self) -> tuple[int, int] | None:
         self._commit_settings()
         audio_kbps = self._read_int_setting(
             self.audio_kbps_var, "Audio kb/s", AUDIO_KBPS_MIN, AUDIO_KBPS_MAX, str(DEFAULT_AUDIO_KBPS)
@@ -862,20 +828,6 @@ class RecorderApp(tk.Tk):
         if sample_khz is None:
             return None
         sample_rate = sample_khz_to_hz(sample_khz)
-        video_kbps = self._read_int_setting(
-            self.video_kbps_var, "Data rate", VIDEO_KBPS_MIN, VIDEO_KBPS_MAX, str(DEFAULT_VIDEO_KBPS)
-        )
-        if video_kbps is None:
-            return None
-        total_kbps = self._read_int_setting(
-            self.total_kbps_var, "Total kb/s", TOTAL_KBPS_MIN, TOTAL_KBPS_MAX, str(DEFAULT_TOTAL_KBPS)
-        )
-        if total_kbps is None:
-            return None
-        if self._rate_source == "total":
-            video_kbps = max(VIDEO_KBPS_MIN, min(VIDEO_KBPS_MAX, total_kbps - audio_kbps))
-        else:
-            total_kbps = audio_kbps + video_kbps
         if audio_kbps < MIN_USEFUL_AUDIO_KBPS:
             if not messagebox.askyesno(
                 "Audio may be too thin",
@@ -890,21 +842,7 @@ class RecorderApp(tk.Tk):
                 "Speech often sounds muffled. Record anyway?",
             ):
                 return None
-        if video_kbps < MIN_USEFUL_VIDEO_KBPS:
-            if not messagebox.askyesno(
-                "Data rate may be too low",
-                f"{video_kbps} kb/s is below {MIN_USEFUL_VIDEO_KBPS} kb/s. "
-                "On-screen text and UI often become hard to read. Record anyway?",
-            ):
-                return None
-        if total_kbps < MIN_USEFUL_TOTAL_KBPS:
-            if not messagebox.askyesno(
-                "Total bit rate may be too low",
-                f"{total_kbps} kb/s is below {MIN_USEFUL_TOTAL_KBPS} kb/s. "
-                "The recording is often too thin to use. Record anyway?",
-            ):
-                return None
-        return audio_kbps, sample_rate, video_kbps, total_kbps
+        return audio_kbps, sample_rate
 
     def _tk_hwnds(self, *widgets: tk.Misc) -> set[int]:
         ids: set[int] = set()
@@ -1243,7 +1181,8 @@ class RecorderApp(tk.Tk):
         parsed = self._read_rate_settings()
         if parsed is None:
             return
-        audio_kbps, sample_rate, video_kbps, total_kbps = parsed
+        audio_kbps, sample_rate = parsed
+        preset, _height, video_kbps = resolve_video_preset(self.resolution_var.get().strip())
 
         mode = self.audio_var.get()
         mic = self._device_by_label(self.mics, self.mic_var.get()) if mode in ("external", "both") else None
@@ -1268,7 +1207,8 @@ class RecorderApp(tk.Tk):
             loopback=loop,
             audio_kbps=clamp_audio_kbps(audio_kbps),
             sample_rate=clamp_sample_rate(sample_rate),
-            video_kbps=clamp_video_kbps(video_kbps),
+            video_preset=preset,
+            video_kbps=video_kbps,
         )
         self.session = CaptureSession(cfg, self.hw, on_log=self._log)
         try:
@@ -1286,8 +1226,7 @@ class RecorderApp(tk.Tk):
             pass
         self._tick()
         self._log(
-            f"Recording {window.label()} @ {fps} fps, "
-            f"video {video_kbps} kb/s, total {total_kbps} kb/s, "
+            f"Recording {window.label()} @ {fps} fps, {preset}, "
             f"Opus {audio_kbps} kb/s {snap_opus_rate(sample_rate) // 1000} kHz -> {cfg.output.name}"
         )
 

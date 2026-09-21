@@ -40,15 +40,16 @@ SAMPLE_KHZ_MIN = SAMPLE_RATE_MIN // 1000
 SAMPLE_KHZ_MAX = SAMPLE_RATE_MAX // 1000
 OPUS_SAMPLE_RATES = (8000, 12000, 16000, 24000, 48000)
 
-DEFAULT_VIDEO_KBPS = 600
-MIN_USEFUL_VIDEO_KBPS = 600
+# Output height presets. Width follows the window so the picture stays in proportion.
+VIDEO_PRESETS = ("144p", "240p", "480p")
+DEFAULT_VIDEO_PRESET = "240p"
+VIDEO_PRESET_HEIGHT = {"144p": 144, "240p": 240, "480p": 480}
+# Lower presets use a lower rate so the file actually gets smaller.
+VIDEO_PRESET_KBPS = {"144p": 150, "240p": 300, "480p": 600}
+
+DEFAULT_VIDEO_KBPS = VIDEO_PRESET_KBPS[DEFAULT_VIDEO_PRESET]
 VIDEO_KBPS_MIN = 100
 VIDEO_KBPS_MAX = 50000
-
-DEFAULT_TOTAL_KBPS = DEFAULT_VIDEO_KBPS + DEFAULT_AUDIO_KBPS
-MIN_USEFUL_TOTAL_KBPS = MIN_USEFUL_VIDEO_KBPS + MIN_USEFUL_AUDIO_KBPS
-TOTAL_KBPS_MIN = VIDEO_KBPS_MIN + AUDIO_KBPS_MIN
-TOTAL_KBPS_MAX = VIDEO_KBPS_MAX + AUDIO_KBPS_MAX
 
 
 @dataclass
@@ -61,6 +62,7 @@ class RecordConfig:
     loopback: AudioDevice | None = None
     audio_kbps: int = DEFAULT_AUDIO_KBPS
     sample_rate: int = DEFAULT_SAMPLE_RATE
+    video_preset: str = DEFAULT_VIDEO_PRESET
     video_kbps: int = DEFAULT_VIDEO_KBPS
 
 
@@ -85,8 +87,22 @@ def clamp_video_kbps(n: int) -> int:
     return max(VIDEO_KBPS_MIN, min(VIDEO_KBPS_MAX, int(n)))
 
 
-def clamp_total_kbps(n: int) -> int:
-    return max(TOTAL_KBPS_MIN, min(TOTAL_KBPS_MAX, int(n)))
+def resolve_video_preset(name: str) -> tuple[str, int, int]:
+    """Return (label, height, kbps) for a 144p / 240p / 480p choice."""
+    key = name if name in VIDEO_PRESET_HEIGHT else DEFAULT_VIDEO_PRESET
+    return key, VIDEO_PRESET_HEIGHT[key], VIDEO_PRESET_KBPS[key]
+
+
+def scaled_frame_size(src_w: int, src_h: int, preset: str) -> tuple[int, int]:
+    """Even width x target height, keeping the source aspect ratio."""
+    _key, target_h, _kbps = resolve_video_preset(preset)
+    src_w = max(2, int(src_w) - (int(src_w) % 2))
+    src_h = max(2, int(src_h) - (int(src_h) % 2))
+    exact = src_w * target_h / src_h
+    out_w = int(round(exact))
+    if out_w % 2:
+        out_w += 1 if exact >= out_w else -1
+    return max(2, out_w), target_h
 
 
 def _ffprobe(hw: HardwareProfile) -> str:
@@ -415,6 +431,8 @@ class CaptureSession:
         self._grab_thread: threading.Thread | None = None
         self._frame_w = 0
         self._frame_h = 0
+        self._src_w = 0
+        self._src_h = 0
         self._screen_x = 0
         self._screen_y = 0
         self._win_state: str | None = None
@@ -435,22 +453,28 @@ class CaptureSession:
         fps = max(1, min(240, int(self.cfg.fps)))
         flags = CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
+        preset, _height, preset_kbps = resolve_video_preset(self.cfg.video_preset)
+        self.cfg.video_preset = preset
+        self.cfg.video_kbps = preset_kbps
+
         if self._hwnd_mode:
             if not self.cfg.window.hwnd:
                 raise RecorderError("That window no longer exists.")
             self._restore = prepare_for_capture(self.cfg.window)
             geo = refresh_geometry(self.cfg.window)
-            self._frame_w, self._frame_h = geo.even_size
+            self._src_w, self._src_h = geo.even_size
+            self._frame_w, self._frame_h = scaled_frame_size(self._src_w, self._src_h, preset)
             self._grabber = WindowGrabber(self.cfg.window.hwnd, self._frame_w, self._frame_h)
             if self._restore.was_minimized:
                 self.on_log(
                     f"Window is minimized — capture continues at "
-                    f"{self._frame_w}x{self._frame_h}. Restore it from the taskbar to see it."
+                    f"{preset} ({self._frame_w}x{self._frame_h}). Restore it from the taskbar to see it."
                 )
         else:
             geo = refresh_geometry(self.cfg.window)
             self._screen_x, self._screen_y = geo.x, geo.y
-            self._frame_w, self._frame_h = geo.even_size
+            self._src_w, self._src_h = geo.even_size
+            self._frame_w, self._frame_h = scaled_frame_size(self._src_w, self._src_h, preset)
 
         cmd = build_hwnd_cmd(
             self.hw,
@@ -474,7 +498,8 @@ class CaptureSession:
         self.on_log(
             f"Audio: {self.cfg.audio_mode} (WASAPI) -> Opus {self.cfg.audio_kbps} kb/s "
             f"{snap_opus_rate(self.cfg.sample_rate)} Hz | "
-            f"video {self.cfg.video_kbps} kb/s | total {total} kb/s"
+            f"video {self.cfg.video_preset} {self._frame_w}x{self._frame_h} "
+            f"({self.cfg.video_kbps} kb/s) | total {total} kb/s"
         )
 
         self.proc = subprocess.Popen(
@@ -567,8 +592,8 @@ class CaptureSession:
                     frame = grab_screen_bgra(
                         self._screen_x,
                         self._screen_y,
-                        self._frame_w,
-                        self._frame_h,
+                        self._src_w,
+                        self._src_h,
                         self._frame_w,
                         self._frame_h,
                     )
@@ -687,7 +712,8 @@ class CaptureSession:
             self.cfg.audio_kbps,
             self.cfg.sample_rate,
             comment=(
-                f"{self.cfg.fps} fps, video {self.cfg.video_kbps} kb/s, "
+                f"{self.cfg.fps} fps, {self.cfg.video_preset} "
+                f"({self._frame_w}x{self._frame_h}, {self.cfg.video_kbps} kb/s), "
                 f"audio {self.cfg.audio_kbps} kb/s, "
                 f"{snap_opus_rate(self.cfg.sample_rate) // 1000} kHz Opus, "
                 f"total {clamp_video_kbps(self.cfg.video_kbps) + clamp_audio_kbps(self.cfg.audio_kbps)} kb/s"
