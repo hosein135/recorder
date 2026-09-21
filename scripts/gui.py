@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import shutil
 import sys
@@ -159,6 +160,66 @@ def ico(name: str) -> str:
     return ICONS.get(name, "")
 
 
+def _hex_rgb(value: str) -> tuple[int, int, int]:
+    value = value.lstrip("#")
+    return int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+
+
+def _round_ppm_file(path: Path, radius: int, color: tuple[int, int, int]) -> None:
+    """Paint pixels outside a rounded rectangle so a thumbnail can sit in a round tile."""
+    import numpy as np
+
+    raw = path.read_bytes()
+    if not raw.startswith(b"P6"):
+        return
+    parts = raw.split(b"\n", 3)
+    if len(parts) < 4:
+        return
+    magic, size, depth, body = parts
+    try:
+        width, height = (int(n) for n in size.split())
+    except ValueError:
+        return
+    arr = np.frombuffer(body, dtype=np.uint8)
+    if arr.size < width * height * 3:
+        return
+    arr = arr[: width * height * 3].reshape(height, width, 3).copy()
+    radius = max(1, min(radius, width // 2, height // 2))
+    yy, xx = np.ogrid[:height, :width]
+    centers = (
+        (radius, radius),
+        (width - radius, radius),
+        (radius, height - radius),
+        (width - radius, height - radius),
+    )
+    outside = np.zeros((height, width), dtype=bool)
+    for cx, cy in centers:
+        box_x = (xx >= cx - radius) & (xx < cx + radius)
+        box_y = (yy >= cy - radius) & (yy < cy + radius)
+        outside |= box_x & box_y & ((xx - cx) ** 2 + (yy - cy) ** 2 > radius ** 2)
+    arr[outside] = color
+    path.write_bytes(b"\n".join((magic, size, depth)) + b"\n" + arr.tobytes())
+
+
+def _cover_corner(canvas: tk.Canvas, cx: float, cy: float, radius: int, corner: str, color: str) -> None:
+    """Fill the square outside one rounded corner."""
+    sweeps = {"tl": (90, 180), "tr": (0, 90), "bl": (180, 270), "br": (270, 360)}
+    tips = {
+        "tl": (cx - radius, cy - radius),
+        "tr": (cx + radius, cy - radius),
+        "bl": (cx - radius, cy + radius),
+        "br": (cx + radius, cy + radius),
+    }
+    start, end = sweeps[corner]
+    points = [tips[corner]]
+    steps = 14
+    for i in range(steps + 1):
+        angle = math.radians(start + (end - start) * i / steps)
+        points.append((cx + radius * math.cos(angle), cy - radius * math.sin(angle)))
+    flat = [coord for point in points for coord in point]
+    canvas.create_polygon(*flat, fill=color, outline=color)
+
+
 def _widget_bg(widget: tk.Misc) -> str:
     for key in ("bg", "background"):
         try:
@@ -222,6 +283,7 @@ class RoundButton(tk.Canvas):
         self._command = command
         self._height = height
         self._min_width = min_width
+        self._drawing = False
         self._text_font = tkfont.Font(self, family=UI_FONT_SEMI, size=10)
         self._icon_font = tkfont.Font(self, family=ICON_FONT, size=12)
         self.bind("<Configure>", lambda _e: self._redraw())
@@ -294,12 +356,33 @@ class RoundButton(tk.Canvas):
         border = ACCENT if self._hover else BORDER
         return fill, fg, border
 
+    def _content_width(self) -> int:
+        side = 22
+        glyph = ico(self._icon) if self._icon else ""
+        gap = 10 if glyph and self._text else 0
+        icon_w = (self._icon_font.measure(glyph) + 6) if glyph else 0
+        text_w = self._text_font.measure(self._text) if self._text else 0
+        return int(icon_w + gap + text_w + side * 2) + 8
+
     def _redraw(self) -> None:
+        if self._drawing:
+            return
+        self._drawing = True
+        try:
+            self._paint()
+        finally:
+            self._drawing = False
+
+    def _paint(self) -> None:
         self.delete("all")
-        width = self.winfo_width()
+        needed = max(self._min_width, self._content_width())
+        current = self.winfo_width()
+        if current < needed:
+            tk.Canvas.configure(self, width=needed)
+            width = needed
+        else:
+            width = current
         height = self.winfo_height()
-        if width < 2:
-            width = self._min_width
         if height < 2:
             height = self._height
         fill, fg, border = self._colors()
@@ -310,16 +393,103 @@ class RoundButton(tk.Canvas):
         glyph = ico(self._icon) if self._icon else ""
         cy = height / 2
         if glyph and self._text:
-            gap = 8
-            icon_w = self._icon_font.measure(glyph)
+            gap = 10
+            icon_w = self._icon_font.measure(glyph) + 6
             text_w = self._text_font.measure(self._text)
-            x = max(12, (width - icon_w - gap - text_w) / 2)
+            x = (width - icon_w - gap - text_w) / 2
             self.create_text(x, cy, text=glyph, anchor="w", font=self._icon_font, fill=fg)
             self.create_text(x + icon_w + gap, cy, text=self._text, anchor="w", font=self._text_font, fill=fg)
         elif glyph:
             self.create_text(width / 2, cy, text=glyph, font=self._icon_font, fill=fg)
         else:
             self.create_text(width / 2, cy, text=self._text, font=self._text_font, fill=fg)
+
+
+class SlimScroll(tk.Canvas):
+    """Thin rounded scrollbar with no arrow buttons."""
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        command: object,
+        orient: str = "vertical",
+        canvas_bg: str | None = None,
+    ) -> None:
+        self._orient = orient
+        bg = canvas_bg or _widget_bg(master)
+        if orient == "horizontal":
+            super().__init__(master, height=10, bg=bg, highlightthickness=0, bd=0)
+        else:
+            super().__init__(master, width=10, bg=bg, highlightthickness=0, bd=0)
+        self._command = command
+        self._first = 0.0
+        self._last = 1.0
+        self._hover = False
+        self._press: tuple[float, float] | None = None
+        self.bind("<Configure>", lambda _e: self._redraw())
+        self.bind("<Enter>", lambda _e: self._set_hover(True))
+        self.bind("<Leave>", lambda _e: self._set_hover(False))
+        self.bind("<Button-1>", self._on_press)
+        self.bind("<B1-Motion>", self._on_drag)
+        self.bind("<ButtonRelease-1>", lambda _e: setattr(self, "_press", None))
+
+    def set(self, first: str, last: str) -> None:
+        self._first = float(first)
+        self._last = float(last)
+        self._redraw()
+
+    def _set_hover(self, on: bool) -> None:
+        self._hover = on
+        self._redraw()
+
+    def _span(self) -> float:
+        return max(0.0, self._last - self._first)
+
+    def _on_press(self, event: tk.Event) -> None:
+        span = self._span()
+        if span >= 0.995:
+            return
+        if self._orient == "vertical":
+            pos = event.y / max(1, self.winfo_height())
+            self._press = (event.y, self._first)
+        else:
+            pos = event.x / max(1, self.winfo_width())
+            self._press = (event.x, self._first)
+        if pos < self._first or pos > self._last:
+            first = min(max(0.0, pos - span / 2), 1.0 - span)
+            self._command("moveto", str(first))
+            self._press = ((event.y if self._orient == "vertical" else event.x), first)
+
+    def _on_drag(self, event: tk.Event) -> None:
+        if self._press is None:
+            return
+        origin, first0 = self._press
+        span = self._span()
+        if self._orient == "vertical":
+            delta = (event.y - origin) / max(1, self.winfo_height())
+        else:
+            delta = (event.x - origin) / max(1, self.winfo_width())
+        first = min(max(0.0, first0 + delta), max(0.0, 1.0 - span))
+        self._command("moveto", str(first))
+
+    def _redraw(self) -> None:
+        self.delete("all")
+        span = self._span()
+        if span >= 0.995:
+            return
+        color = "#8b97ab" if self._hover else "#c5cedb"
+        if self._orient == "vertical":
+            length = max(1, self.winfo_height())
+            thickness = max(8, self.winfo_width())
+            thumb = max(36, int(span * length))
+            top = int(self._first * (length - thumb))
+            _round_shape(self, 1, top + 1, thickness - 1, top + thumb - 1, 4, color)
+        else:
+            length = max(1, self.winfo_width())
+            thickness = max(8, self.winfo_height())
+            thumb = max(36, int(span * length))
+            left = int(self._first * (length - thumb))
+            _round_shape(self, left + 1, 1, left + thumb - 1, thickness - 1, 4, color)
 
 
 class RoundBadge(tk.Canvas):
@@ -897,10 +1067,10 @@ class RecorderApp(tk.Tk):
         self.win_list.column("app", width=110, anchor="w", stretch=False)
         self.win_list.column("size", width=88, anchor="center", stretch=False)
         self.win_list.column("state", width=92, anchor="w", stretch=False)
-        scroll = ttk.Scrollbar(list_wrap, command=self.win_list.yview)
+        scroll = SlimScroll(list_wrap, command=self.win_list.yview, canvas_bg=BG)
         self.win_list.configure(yscrollcommand=scroll.set)
         self.win_list.pack(side="left", fill="both", expand=True)
-        scroll.pack(side="right", fill="y")
+        scroll.pack(side="right", fill="y", padx=(6, 0))
         self.win_list.bind("<<TreeviewSelect>>", self._on_win_select)
         self.win_list.bind("<Double-Button-1>", lambda _e: self._open_share_picker())
         self.win_list.tag_configure("odd", background=PANEL)
@@ -967,10 +1137,10 @@ class RecorderApp(tk.Tk):
         self.rec_list.column("name", width=460, anchor="w", stretch=True)
         self.rec_list.column("size", width=90, anchor="e", stretch=False)
         self.rec_list.column("modified", width=170, anchor="w", stretch=False)
-        rec_scroll = ttk.Scrollbar(rec_wrap, command=self.rec_list.yview)
+        rec_scroll = SlimScroll(rec_wrap, command=self.rec_list.yview, canvas_bg=BG)
         self.rec_list.configure(yscrollcommand=rec_scroll.set)
         self.rec_list.pack(side="left", fill="both", expand=True)
-        rec_scroll.pack(side="right", fill="y")
+        rec_scroll.pack(side="right", fill="y", padx=(6, 0))
         self.rec_info = ttk.Label(self.recs_tab, text="", style="Muted.TLabel")
         self.rec_info.pack(fill="x", padx=12, pady=(0, 10))
         self.rec_list.bind("<Double-Button-1>", self._on_recording_click)
@@ -1015,7 +1185,7 @@ class RecorderApp(tk.Tk):
             padx=12,
             pady=10,
         )
-        scroll = ttk.Scrollbar(log_wrap, command=self.log.yview)
+        scroll = SlimScroll(log_wrap, command=self.log.yview, canvas_bg=BG)
         self.log.configure(yscrollcommand=scroll.set)
         self.log.pack(side="left", fill="both", expand=True)
         scroll.pack(side="right", fill="y")
@@ -1025,7 +1195,7 @@ class RecorderApp(tk.Tk):
         host = tk.Frame(self.settings_tab, bg=BG)
         host.pack(fill="both", expand=True, padx=12, pady=(10, 10))
         canvas = tk.Canvas(host, bg=BG, highlightthickness=0, bd=0)
-        scroll = ttk.Scrollbar(host, orient="vertical", command=canvas.yview)
+        scroll = SlimScroll(host, command=canvas.yview, canvas_bg=BG)
         inner = ttk.Frame(canvas)
         inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
         win = canvas.create_window((0, 0), window=inner, anchor="nw")
@@ -1465,7 +1635,7 @@ class RecorderApp(tk.Tk):
         wrap = ttk.Frame(dlg)
         wrap.pack(fill="both", expand=True, padx=16, pady=4)
         canvas = tk.Canvas(wrap, bg=BG, highlightthickness=0)
-        scroll = ttk.Scrollbar(wrap, orient="vertical", command=canvas.yview)
+        scroll = SlimScroll(wrap, command=canvas.yview, canvas_bg=BG)
         host = ttk.Frame(canvas)
         host.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
         win_id = canvas.create_window((0, 0), window=host, anchor="nw")
@@ -1522,47 +1692,50 @@ class RecorderApp(tk.Tk):
             self._select_window_info(info)
 
         def add_card(parent: ttk.Frame, col: int, row: int, info: WindowInfo, photo: tk.PhotoImage) -> None:
-            card = tk.Frame(
-                parent,
-                bg=PANEL,
-                highlightbackground=BORDER,
-                highlightthickness=1,
-                cursor="hand2",
-                bd=0,
-            )
-            card.grid(row=row, column=col, padx=8, pady=8, sticky="n")
-            img = tk.Label(card, image=photo, bg=PANEL, cursor="hand2")
-            img.pack(padx=6, pady=(6, 2))
             title = info.title.replace("\n", " ").strip() or "(untitled)"
             if info.is_desktop:
                 title = "Entire screen"
             if len(title) > 34:
                 title = title[:31] + "..."
             sub = "display" if info.is_desktop else (info.exe or "")
-            cap = tk.Label(
-                card,
-                text=f"{title}\n{sub}",
-                bg=PANEL,
-                fg=FG,
-                font=(UI_FONT, 9),
-                justify="center",
+            radius = 18
+            pad = 8
+            tile_w = photo.width() + pad * 2
+            tile_h = photo.height() + pad * 2 + 46
+            card = tk.Canvas(
+                parent,
+                width=tile_w,
+                height=tile_h,
+                bg=BG,
+                highlightthickness=0,
+                bd=0,
                 cursor="hand2",
             )
-            cap.pack(padx=6, pady=(0, 8))
+            card.grid(row=row, column=col, padx=8, pady=8, sticky="n")
+            title_font = tkfont.Font(card, family=UI_FONT_SEMI, size=9)
+            sub_font = tkfont.Font(card, family=UI_FONT, size=8)
 
-            def on_click(_event: object | None = None, target: WindowInfo = info) -> None:
-                choose(target)
+            def paint(border: str) -> None:
+                card.delete("all")
+                _round_shape(card, 1, 1, tile_w - 1, tile_h - 1, radius, border)
+                _round_shape(card, 2, 2, tile_w - 2, tile_h - 2, radius - 1, PANEL)
+                card.create_image(pad, pad, image=photo, anchor="nw")
+                image_r = 14
+                ix, iy = pad, pad
+                iw, ih = photo.width(), photo.height()
+                _cover_corner(card, ix + image_r, iy + image_r, image_r, "tl", PANEL)
+                _cover_corner(card, ix + iw - image_r, iy + image_r, image_r, "tr", PANEL)
+                _cover_corner(card, ix + image_r, iy + ih - image_r, image_r, "bl", PANEL)
+                _cover_corner(card, ix + iw - image_r, iy + ih - image_r, image_r, "br", PANEL)
+                text_y = pad + ih + 10
+                card.create_text(tile_w / 2, text_y, text=title, font=title_font, fill=FG, anchor="n")
+                card.create_text(tile_w / 2, text_y + 18, text=sub, font=sub_font, fill=MUTED, anchor="n")
+                card.image = photo
 
-            def enter(_e: object, c: tk.Frame = card) -> None:
-                c.configure(highlightbackground=ACCENT, highlightthickness=2)
-
-            def leave(_e: object, c: tk.Frame = card) -> None:
-                c.configure(highlightbackground=BORDER, highlightthickness=1)
-
-            for w in (card, img, cap):
-                w.bind("<Button-1>", on_click)
-                w.bind("<Enter>", enter)
-                w.bind("<Leave>", leave)
+            paint(BORDER)
+            card.bind("<Button-1>", lambda _e, target=info: choose(target))
+            card.bind("<Enter>", lambda _e: paint(ACCENT))
+            card.bind("<Leave>", lambda _e: paint(BORDER))
 
         def fill(rows: list[tuple[WindowInfo, Path]]) -> None:
             if closed["done"] or not dlg.winfo_exists():
@@ -1573,8 +1746,9 @@ class RecorderApp(tk.Tk):
             dlg._photos.clear()
             for i, (info, path) in enumerate(rows):
                 try:
+                    _round_ppm_file(path, 14, _hex_rgb(PANEL))
                     photo = tk.PhotoImage(file=str(path))
-                except tk.TclError:
+                except (tk.TclError, OSError):
                     continue
                 dlg._photos.append(photo)
                 add_card(host, i % 3, i // 3, info, photo)
