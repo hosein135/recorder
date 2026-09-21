@@ -30,7 +30,7 @@ if sys.platform == "win32":
             pass
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 
 from audio import AudioDevice, default_loopback, default_microphone, list_loopbacks, list_microphones
 from capture import (
@@ -86,6 +86,424 @@ ON_COLOR = "#ffffff"
 PAUSED_BG = "#fff4d4"
 PAUSED_FG = "#8a5a00"
 
+ICON_FONT = "Segoe UI"
+UI_FONT = "Segoe UI"
+UI_FONT_SEMI = "Segoe UI Semibold"
+_MDL2 = {
+    "record": "\uE7C8",
+    "stop": "\uE71A",
+    "play": "\uE768",
+    "pause": "\uE769",
+    "refresh": "\uE72C",
+    "search": "\uE721",
+    "settings": "\uE713",
+    "folder": "\uE8B7",
+    "folderopen": "\uE838",
+    "mic": "\uE720",
+    "video": "\uE714",
+    "history": "\uE81C",
+    "plus": "\uE710",
+    "minus": "\uE738",
+    "volume": "\uE767",
+    "clock": "\uE823",
+    "pointer": "\uE7C9",
+    "window": "\uE8A7",
+    "people": "\uE716",
+    "cancel": "\uE711",
+    "open": "\uE8E5",
+}
+_FALLBACK = {
+    "record": "●",
+    "stop": "■",
+    "play": ">",
+    "pause": "||",
+    "refresh": "R",
+    "search": "S",
+    "settings": "*",
+    "folder": "F",
+    "folderopen": "F",
+    "mic": "M",
+    "video": "V",
+    "history": "A",
+    "plus": "+",
+    "minus": "-",
+    "volume": "L",
+    "clock": "T",
+    "pointer": "+",
+    "window": "W",
+    "people": "B",
+    "cancel": "X",
+    "open": "O",
+}
+ICONS = _FALLBACK
+
+
+def install_icons(root: tk.Misc) -> None:
+    global ICON_FONT, ICONS, UI_FONT, UI_FONT_SEMI
+    families = set(tkfont.families(root))
+    if "Bahnschrift" in families:
+        UI_FONT = "Bahnschrift"
+        UI_FONT_SEMI = "Bahnschrift SemiBold" if "Bahnschrift SemiBold" in families else "Bahnschrift"
+    else:
+        UI_FONT = "Segoe UI"
+        UI_FONT_SEMI = "Segoe UI Semibold"
+    if "Segoe MDL2 Assets" in families or "Segoe Fluent Icons" in families:
+        ICON_FONT = "Segoe Fluent Icons" if "Segoe Fluent Icons" in families else "Segoe MDL2 Assets"
+        ICONS = _MDL2
+    else:
+        ICON_FONT = UI_FONT
+        ICONS = _FALLBACK
+
+
+def ico(name: str) -> str:
+    return ICONS.get(name, "")
+
+
+def _widget_bg(widget: tk.Misc) -> str:
+    for key in ("bg", "background"):
+        try:
+            value = str(widget.cget(key))
+        except tk.TclError:
+            continue
+        if value:
+            return value
+    return BG
+
+
+def _round_shape(canvas: tk.Canvas, x1: int, y1: int, x2: int, y2: int, radius: int, fill: str) -> None:
+    r = max(1, min(radius, (x2 - x1) // 2, (y2 - y1) // 2))
+    kw = {"fill": fill, "outline": fill}
+    canvas.create_arc(x1, y1, x1 + 2 * r, y1 + 2 * r, start=90, extent=90, style="pieslice", **kw)
+    canvas.create_arc(x2 - 2 * r, y1, x2, y1 + 2 * r, start=0, extent=90, style="pieslice", **kw)
+    canvas.create_arc(x1, y2 - 2 * r, x1 + 2 * r, y2, start=180, extent=90, style="pieslice", **kw)
+    canvas.create_arc(x2 - 2 * r, y2 - 2 * r, x2, y2, start=270, extent=90, style="pieslice", **kw)
+    canvas.create_rectangle(x1 + r, y1, x2 - r, y2, **kw)
+    canvas.create_rectangle(x1, y1 + r, x2, y2 - r, **kw)
+
+
+class RoundButton(tk.Canvas):
+    """Pill button. configure() accepts text, icon, state, and the old ttk style names."""
+
+    _STYLES = {
+        "Record.TButton": ("record", "record"),
+        "Stop.TButton": ("stop", "stop"),
+        "Accent.TButton": ("accent", None),
+        "Ghost.TButton": ("ghost", None),
+    }
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        text: str = "",
+        command: object | None = None,
+        kind: str = "ghost",
+        icon: str = "",
+        height: int = 40,
+        min_width: int = 96,
+        canvas_bg: str | None = None,
+    ) -> None:
+        page = canvas_bg or _widget_bg(master)
+        super().__init__(
+            master,
+            height=height,
+            width=min_width,
+            bg=page,
+            highlightthickness=0,
+            bd=0,
+            cursor="hand2",
+        )
+        self._page = page
+        self._text = text
+        self._icon = icon
+        self._kind = kind
+        self._state = "normal"
+        self._hover = False
+        self._selected = False
+        self._command = command
+        self._height = height
+        self._min_width = min_width
+        self._text_font = tkfont.Font(self, family=UI_FONT_SEMI, size=10)
+        self._icon_font = tkfont.Font(self, family=ICON_FONT, size=12)
+        self.bind("<Configure>", lambda _e: self._redraw())
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<Button-1>", self._on_click)
+        self._redraw()
+
+    def set_selected(self, selected: bool) -> None:
+        self._selected = selected
+        self._redraw()
+
+    def _on_enter(self, _event: object) -> None:
+        if self._state == "disabled":
+            return
+        self._hover = True
+        self._redraw()
+
+    def _on_leave(self, _event: object) -> None:
+        self._hover = False
+        self._redraw()
+
+    def _on_click(self, _event: object) -> None:
+        if self._state == "disabled" or self._command is None:
+            return
+        self._command()
+
+    def configure(self, cnf: object = None, **kw: object) -> object:  # type: ignore[override]
+        if isinstance(cnf, dict):
+            kw = {**cnf, **kw}
+        changed = False
+        if "text" in kw:
+            self._text = str(kw.pop("text"))
+            changed = True
+        if "icon" in kw:
+            self._icon = str(kw.pop("icon"))
+            changed = True
+        if "state" in kw:
+            self._state = str(kw.pop("state"))
+            tk.Canvas.configure(self, cursor="arrow" if self._state == "disabled" else "hand2")
+            changed = True
+        if "style" in kw:
+            kind, icon = self._STYLES.get(str(kw.pop("style")), (self._kind, None))
+            self._kind = kind
+            if icon:
+                self._icon = icon
+            changed = True
+        if changed:
+            self._redraw()
+        if kw:
+            return tk.Canvas.configure(self, **kw)
+        return None
+
+    config = configure
+
+    def _colors(self) -> tuple[str, str, str]:
+        if self._state == "disabled":
+            return PANEL2, MUTED, BORDER
+        if self._selected or self._kind == "accent":
+            fill = ACCENT_HOVER if self._hover else ACCENT
+            return fill, ON_COLOR, fill
+        if self._kind == "record":
+            fill = RECORD_HOVER if self._hover else RECORD
+            return fill, ON_COLOR, fill
+        if self._kind == "stop":
+            fill = RECORD if self._hover else RECORD_HOVER
+            return fill, ON_COLOR, fill
+        fill = ACCENT_DIM if self._hover else PANEL
+        fg = ACCENT if self._hover else FG
+        border = ACCENT if self._hover else BORDER
+        return fill, fg, border
+
+    def _redraw(self) -> None:
+        self.delete("all")
+        width = self.winfo_width()
+        height = self.winfo_height()
+        if width < 2:
+            width = self._min_width
+        if height < 2:
+            height = self._height
+        fill, fg, border = self._colors()
+        radius = height // 2
+        _round_shape(self, 1, 1, width - 1, height - 1, radius, border)
+        inset = 2 if border != fill else 1
+        _round_shape(self, inset, inset, width - inset, height - inset, max(1, radius - 1), fill)
+        glyph = ico(self._icon) if self._icon else ""
+        cy = height / 2
+        if glyph and self._text:
+            gap = 8
+            icon_w = self._icon_font.measure(glyph)
+            text_w = self._text_font.measure(self._text)
+            x = max(12, (width - icon_w - gap - text_w) / 2)
+            self.create_text(x, cy, text=glyph, anchor="w", font=self._icon_font, fill=fg)
+            self.create_text(x + icon_w + gap, cy, text=self._text, anchor="w", font=self._text_font, fill=fg)
+        elif glyph:
+            self.create_text(width / 2, cy, text=glyph, font=self._icon_font, fill=fg)
+        else:
+            self.create_text(width / 2, cy, text=self._text, font=self._text_font, fill=fg)
+
+
+class RoundBadge(tk.Canvas):
+    """Pill label. configure() accepts text, bg, fg, and the old badge style names."""
+
+    _STYLES = {
+        "Live.TLabel": (RECORD, ON_COLOR),
+        "Paused.TLabel": (PAUSED_BG, PAUSED_FG),
+        "Ready.TLabel": (OK_BG, OK),
+        "Badge.TLabel": (ACCENT_DIM, ACCENT),
+    }
+
+    def __init__(
+        self,
+        master: tk.Misc,
+        text: str,
+        fill: str,
+        fg: str,
+        canvas_bg: str | None = None,
+        height: int = 26,
+    ) -> None:
+        page = canvas_bg or _widget_bg(master)
+        super().__init__(master, height=height, width=48, bg=page, highlightthickness=0, bd=0)
+        self._text = text
+        self._fill = fill
+        self._fg = fg
+        self._height = height
+        self._font = tkfont.Font(self, family=UI_FONT_SEMI, size=9)
+        self._drawing = False
+        self._redraw()
+
+    def configure(self, cnf: object = None, **kw: object) -> object:  # type: ignore[override]
+        if isinstance(cnf, dict):
+            kw = {**cnf, **kw}
+        changed = False
+        if "text" in kw:
+            self._text = str(kw.pop("text"))
+            changed = True
+        if "bg" in kw:
+            self._fill = str(kw.pop("bg"))
+            changed = True
+        if "fg" in kw:
+            self._fg = str(kw.pop("fg"))
+            changed = True
+        if "style" in kw:
+            fill, fg = self._STYLES.get(str(kw.pop("style")), (self._fill, self._fg))
+            self._fill, self._fg = fill, fg
+            changed = True
+        if changed:
+            self._redraw()
+        if kw:
+            return tk.Canvas.configure(self, **kw)
+        return None
+
+    config = configure
+
+    def _redraw(self) -> None:
+        if self._drawing:
+            return
+        self._drawing = True
+        try:
+            self.delete("all")
+            width = self._font.measure(self._text) + 28
+            height = self._height
+            tk.Canvas.configure(self, width=width, height=height)
+            radius = height // 2
+            _round_shape(self, 1, 1, width - 1, height - 1, radius, self._fill)
+            self.create_text(width / 2, height / 2, text=self._text, font=self._font, fill=self._fg)
+        finally:
+            self._drawing = False
+
+
+class PillBar(tk.Frame):
+    def __init__(
+        self,
+        master: tk.Misc,
+        variable: tk.StringVar,
+        options: list[tuple[str, str, str]],
+        command: object | None = None,
+        bg: str = PANEL2,
+    ) -> None:
+        super().__init__(master, bg=bg)
+        self._var = variable
+        self._command = command
+        self._buttons: list[tuple[str, RoundButton]] = []
+        for value, label, icon in options:
+            btn = RoundButton(
+                self,
+                text=label,
+                icon=icon,
+                kind="ghost",
+                height=34,
+                min_width=72,
+                canvas_bg=bg,
+                command=lambda v=value: self._pick(v),
+            )
+            btn.pack(side="left", padx=(0, 6), pady=6)
+            self._buttons.append((value, btn))
+        variable.trace_add("write", lambda *_: self._sync())
+        self._sync()
+
+    def _pick(self, value: str) -> None:
+        if self._var.get() != value:
+            self._var.set(value)
+        else:
+            self._sync()
+        if self._command is not None:
+            self._command()
+
+    def _sync(self) -> None:
+        current = self._var.get()
+        for value, btn in self._buttons:
+            btn.set_selected(value == current)
+
+
+class NumberStepper(tk.Frame):
+    def __init__(
+        self,
+        master: tk.Misc,
+        variable: tk.StringVar,
+        lo: int,
+        hi: int,
+        step: int,
+        bg: str = PANEL2,
+    ) -> None:
+        super().__init__(master, bg=bg)
+        self.var = variable
+        self.lo = lo
+        self.hi = hi
+        self.step = step
+        RoundButton(
+            self, icon="minus", kind="ghost", height=34, min_width=34, canvas_bg=bg, command=lambda: self._bump(-1)
+        ).pack(side="left")
+        well = tk.Frame(self, bg=bg, width=84, height=34)
+        well.pack(side="left", padx=6)
+        well.pack_propagate(False)
+        self._canvas = tk.Canvas(well, width=84, height=34, bg=bg, highlightthickness=0, bd=0)
+        self._canvas.pack(fill="both", expand=True)
+        self._entry = tk.Entry(
+            self._canvas,
+            textvariable=variable,
+            relief="flat",
+            justify="center",
+            bg=PANEL,
+            fg=FG,
+            insertbackground=FG,
+            font=(UI_FONT_SEMI, 12),
+            width=5,
+            highlightthickness=0,
+            bd=0,
+        )
+        self._canvas.bind("<Configure>", self._paint)
+        self._entry.bind("<FocusOut>", lambda _e: self._clamp())
+        self._entry.bind("<Return>", lambda _e: self._clamp())
+        RoundButton(
+            self, icon="plus", kind="ghost", height=34, min_width=34, canvas_bg=bg, command=lambda: self._bump(1)
+        ).pack(side="left")
+        self._paint()
+
+    def get(self) -> str:
+        return self._entry.get()
+
+    def _paint(self, _event: object | None = None) -> None:
+        width = max(84, self._canvas.winfo_width())
+        height = max(34, self._canvas.winfo_height())
+        self._canvas.delete("all")
+        _round_shape(self._canvas, 1, 1, width - 1, height - 1, height // 2, BORDER)
+        _round_shape(self._canvas, 2, 2, width - 2, height - 2, max(1, height // 2 - 1), PANEL)
+        self._entry.place(x=8, y=4, width=max(20, width - 16), height=max(16, height - 8))
+
+    def _clamp(self) -> None:
+        try:
+            n = int(str(self.var.get()).strip())
+        except ValueError:
+            n = self.lo
+        self.var.set(str(max(self.lo, min(self.hi, n))))
+
+    def _bump(self, direction: int) -> None:
+        try:
+            n = int(str(self.var.get()).strip())
+        except ValueError:
+            n = self.lo
+        self.var.set(str(max(self.lo, min(self.hi, n + direction * self.step))))
+
 
 class RecorderApp(tk.Tk):
     def __init__(self) -> None:
@@ -105,10 +523,12 @@ class RecorderApp(tk.Tk):
         self._timer_hold = False
         self.output_dir = _ROOT / "recordings"
         self._rec_by_id: dict[str, Path] = {}
-        self._min_labels: dict[str, tk.Label] = {}
+        self._min_labels: dict[str, RoundBadge] = {}
         self._min_floors: dict[str, int] = {}
-        self._setting_spins: dict[str, tuple[ttk.Spinbox, tk.StringVar]] = {}
+        self._setting_spins: dict[str, tuple[NumberStepper, tk.StringVar]] = {}
+        self._tab_icons: dict[str, tk.Label] = {}
 
+        install_icons(self)
         self._style()
         self._build()
         self.after_idle(self._maximize)
@@ -142,12 +562,16 @@ class RecorderApp(tk.Tk):
         h = self.winfo_screenheight()
         self.geometry(f"{w}x{h}+0+0")
 
-    def _card(self, parent: tk.Misc, title: str) -> tk.Frame:
+    def _card(self, parent: tk.Misc, title: str, icon: str = "") -> tk.Frame:
         outer = tk.Frame(parent, bg=PANEL, highlightthickness=1, highlightbackground=BORDER)
         outer.pack(fill="x", pady=(0, 14))
         body = tk.Frame(outer, bg=PANEL)
         body.pack(fill="x", padx=16, pady=14)
-        ttk.Label(body, text=title, style="Section.TLabel").pack(anchor="w", pady=(0, 12))
+        head = tk.Frame(body, bg=PANEL)
+        head.pack(anchor="w", pady=(0, 12))
+        if icon:
+            tk.Label(head, text=ico(icon), bg=PANEL, fg=ACCENT, font=(ICON_FONT, 14)).pack(side="left", padx=(0, 8))
+        ttk.Label(head, text=title, style="Section.TLabel").pack(side="left")
         return body
 
     def _add_setting_row(
@@ -162,45 +586,33 @@ class RecorderApp(tk.Tk):
         min_ok: int,
         key: str,
         unit: str,
+        icon: str = "",
     ) -> None:
         rowf = tk.Frame(grid, bg=PANEL2, highlightthickness=0)
-        rowf.grid(row=row, column=0, sticky="ew", pady=3)
+        rowf.grid(row=row, column=0, sticky="ew", pady=4)
+        if icon:
+            tk.Label(rowf, text=ico(icon), bg=PANEL2, fg=ACCENT, font=(ICON_FONT, 12)).pack(
+                side="left", padx=(12, 0), pady=8
+            )
         tk.Label(
             rowf,
             text=title,
             bg=PANEL2,
             fg=MUTED,
-            font=("Segoe UI", 9),
-            width=12,
+            font=(UI_FONT, 9),
+            width=11,
             anchor="w",
-        ).pack(side="left", padx=(10, 4), pady=8)
-        spin = ttk.Spinbox(rowf, textvariable=var, from_=lo, to=hi, increment=step, width=8)
-        spin.pack(side="left")
+        ).pack(side="left", padx=(8, 4), pady=8)
+        spin = NumberStepper(rowf, var, lo, hi, step, bg=PANEL2)
+        spin.pack(side="left", pady=6)
         self._setting_spins[key] = (spin, var)
-        spin.bind("<FocusOut>", lambda _e, s=spin, v=var: v.set(str(s.get()).strip()), add="+")
-        tk.Label(rowf, text=unit, bg=PANEL2, fg=MUTED, font=("Segoe UI", 8), anchor="w").pack(
+        tk.Label(rowf, text=unit, bg=PANEL2, fg=MUTED, font=(UI_FONT, 8), anchor="w").pack(
             side="left", padx=(6, 8)
         )
         tk.Frame(rowf, bg=PANEL2).pack(side="left", fill="x", expand=True)
-        chip = tk.Label(
-            rowf,
-            text=f"min {min_ok} {unit}",
-            bg=CHIP_BG,
-            fg=MUTED,
-            font=("Segoe UI", 8),
-            padx=8,
-            pady=2,
-        )
+        chip = RoundBadge(rowf, f"min {min_ok} {unit}".strip(), CHIP_BG, MUTED, canvas_bg=PANEL2, height=24)
         chip.pack(side="right", padx=(0, 10), pady=8)
-        range_chip = tk.Label(
-            rowf,
-            text=f"range {lo}–{hi} {unit}",
-            bg=CHIP_BG,
-            fg=MUTED,
-            font=("Segoe UI", 8),
-            padx=8,
-            pady=2,
-        )
+        range_chip = RoundBadge(rowf, f"range {lo}–{hi} {unit}".strip(), CHIP_BG, MUTED, canvas_bg=PANEL2, height=24)
         range_chip.pack(side="right", padx=(0, 8), pady=8)
         self._min_labels[key] = chip
         self._min_floors[key] = min_ok
@@ -214,32 +626,42 @@ class RecorderApp(tk.Tk):
         style.configure(".", background=BG, foreground=FG, fieldbackground=PANEL, bordercolor=BORDER)
         style.configure("TFrame", background=BG)
         style.configure("Panel.TFrame", background=PANEL)
-        style.configure("TLabel", background=BG, foreground=FG, font=("Segoe UI", 10))
-        style.configure("Muted.TLabel", background=BG, foreground=MUTED, font=("Segoe UI", 9))
-        style.configure("Warn.TLabel", background=BG, foreground=WARN, font=("Segoe UI", 8))
-        style.configure("Hint.TLabel", background=BG, foreground=MUTED, font=("Segoe UI", 8))
+        style.configure("TLabel", background=BG, foreground=FG, font=(UI_FONT, 10))
+        style.configure("Muted.TLabel", background=BG, foreground=MUTED, font=(UI_FONT, 9))
+        style.configure("Warn.TLabel", background=BG, foreground=WARN, font=(UI_FONT, 8))
+        style.configure("Hint.TLabel", background=BG, foreground=MUTED, font=(UI_FONT, 8))
         style.configure("Panel.TLabel", background=PANEL, foreground=FG)
         style.configure("Side.TFrame", background=PANEL)
-        style.configure("Section.TLabel", background=PANEL, foreground=FG, font=("Segoe UI Semibold", 13))
-        style.configure("Side.TLabel", background=PANEL, foreground=MUTED, font=("Segoe UI", 9))
-        style.configure("Side.TRadiobutton", background=PANEL2, foreground=FG, font=("Segoe UI", 10), padding=(8, 4))
+        style.configure("Section.TLabel", background=PANEL, foreground=FG, font=(UI_FONT_SEMI, 13))
+        style.configure("Side.TLabel", background=PANEL, foreground=MUTED, font=(UI_FONT, 9))
+        style.configure("Side.TRadiobutton", background=PANEL2, foreground=FG, font=(UI_FONT, 10), padding=(8, 4))
         style.map(
             "Side.TRadiobutton",
             background=[("active", PANEL2)],
             foreground=[("selected", ACCENT), ("active", ACCENT)],
         )
-        style.configure("Title.TLabel", background=BG, foreground=FG, font=("Segoe UI Semibold", 22))
-        style.configure("Timer.TLabel", background=BG, foreground=FG, font=("Consolas", 22))
-        style.configure("Badge.TLabel", background=ACCENT_DIM, foreground=ACCENT, font=("Segoe UI Semibold", 9), padding=(10, 4))
-        style.configure("Live.TLabel", background=RECORD, foreground=ON_COLOR, font=("Segoe UI Semibold", 9), padding=(10, 4))
-        style.configure("Ready.TLabel", background=OK_BG, foreground=OK, font=("Segoe UI Semibold", 9), padding=(10, 4))
-        style.configure("Paused.TLabel", background=PAUSED_BG, foreground=PAUSED_FG, font=("Segoe UI Semibold", 9), padding=(10, 4))
-        style.configure("Field.TLabel", background=BG, foreground=MUTED, font=("Segoe UI", 9), width=12)
-        style.configure("TRadiobutton", background=BG, foreground=FG, font=("Segoe UI", 10), padding=(6, 4))
+        style.configure("Title.TLabel", background=BG, foreground=FG, font=(UI_FONT_SEMI, 22))
+        style.configure("Timer.TLabel", background=BG, foreground=FG, font=(UI_FONT_SEMI, 22))
+        for font_name, family, size in (
+            ("TkDefaultFont", UI_FONT, 10),
+            ("TkTextFont", UI_FONT, 10),
+            ("TkMenuFont", UI_FONT, 10),
+            ("TkHeadingFont", UI_FONT_SEMI, 11),
+        ):
+            try:
+                tkfont.nametofont(font_name).configure(family=family, size=size)
+            except tk.TclError:
+                pass
+        style.configure("Badge.TLabel", background=ACCENT_DIM, foreground=ACCENT, font=(UI_FONT_SEMI, 9), padding=(10, 4))
+        style.configure("Live.TLabel", background=RECORD, foreground=ON_COLOR, font=(UI_FONT_SEMI, 9), padding=(10, 4))
+        style.configure("Ready.TLabel", background=OK_BG, foreground=OK, font=(UI_FONT_SEMI, 9), padding=(10, 4))
+        style.configure("Paused.TLabel", background=PAUSED_BG, foreground=PAUSED_FG, font=(UI_FONT_SEMI, 9), padding=(10, 4))
+        style.configure("Field.TLabel", background=BG, foreground=MUTED, font=(UI_FONT, 9), width=12)
+        style.configure("TRadiobutton", background=BG, foreground=FG, font=(UI_FONT, 10), padding=(6, 4))
         style.map("TRadiobutton", background=[("active", BG)], foreground=[("selected", ACCENT)])
         style.configure(
             "TButton",
-            font=("Segoe UI", 10),
+            font=(UI_FONT, 10),
             padding=(12, 8),
             background=PANEL,
             foreground=FG,
@@ -256,7 +678,7 @@ class RecorderApp(tk.Tk):
         )
         style.configure(
             "Ghost.TButton",
-            font=("Segoe UI", 10),
+            font=(UI_FONT, 10),
             padding=(12, 8),
             background=PANEL,
             foreground=FG,
@@ -272,7 +694,7 @@ class RecorderApp(tk.Tk):
         )
         style.configure(
             "Accent.TButton",
-            font=("Segoe UI Semibold", 10),
+            font=(UI_FONT_SEMI, 10),
             padding=(16, 8),
             background=ACCENT,
             foreground=ON_COLOR,
@@ -289,7 +711,7 @@ class RecorderApp(tk.Tk):
         )
         style.configure(
             "Record.TButton",
-            font=("Segoe UI Semibold", 12),
+            font=(UI_FONT_SEMI, 12),
             padding=(18, 12),
             background=RECORD,
             foreground=ON_COLOR,
@@ -305,7 +727,7 @@ class RecorderApp(tk.Tk):
         )
         style.configure(
             "Stop.TButton",
-            font=("Segoe UI Semibold", 12),
+            font=(UI_FONT_SEMI, 12),
             padding=(18, 12),
             background=RECORD_HOVER,
             foreground=ON_COLOR,
@@ -336,21 +758,21 @@ class RecorderApp(tk.Tk):
         style.configure("TSpinbox", fieldbackground=PANEL, background=PANEL, foreground=FG, arrowcolor=MUTED, padding=4)
         style.map("TSpinbox", fieldbackground=[("!disabled", PANEL)], foreground=[("!disabled", FG)])
         style.configure("TLabelframe", background=BG, foreground=FG, bordercolor=BORDER, relief="solid", borderwidth=1)
-        style.configure("TLabelframe.Label", background=BG, foreground=FG, font=("Segoe UI Semibold", 11))
+        style.configure("TLabelframe.Label", background=BG, foreground=FG, font=(UI_FONT_SEMI, 11))
         style.configure(
             "Treeview",
             background=PANEL,
             foreground=FG,
             fieldbackground=PANEL,
             rowheight=28,
-            font=("Segoe UI", 10),
+            font=(UI_FONT, 10),
             borderwidth=0,
         )
         style.configure(
             "Treeview.Heading",
             background=PANEL2,
             foreground=MUTED,
-            font=("Segoe UI Semibold", 9),
+            font=(UI_FONT_SEMI, 9),
             relief="flat",
             padding=(6, 8),
         )
@@ -361,15 +783,16 @@ class RecorderApp(tk.Tk):
         self.option_add("*TCombobox*Listbox.foreground", FG)
         self.option_add("*TCombobox*Listbox.selectBackground", ACCENT_DIM)
         self.option_add("*TCombobox*Listbox.selectForeground", FG)
-        self.option_add("*TCombobox*Listbox.font", "Segoe UI 10")
+        self.option_add("*TCombobox*Listbox.font", f"{UI_FONT} 10")
         style.configure("Horizontal.TProgressbar", background=ACCENT, troughcolor=PANEL2)
 
     def _build(self) -> None:
-        header = ttk.Frame(self)
-        header.pack(fill="x", padx=18, pady=(14, 8))
-        ttk.Label(header, text="Window Recorder", style="Title.TLabel").pack(side="left")
-        ttk.Label(header, text="H.266 / VVC  ·  Opus", style="Badge.TLabel").pack(side="left", padx=(12, 0))
-        self.state_badge = ttk.Label(header, text="READY", style="Ready.TLabel")
+        header = tk.Frame(self, bg=BG)
+        header.pack(fill="x", padx=18, pady=(16, 8))
+        tk.Label(header, text=ico("video"), bg=BG, fg=ACCENT, font=(ICON_FONT, 20)).pack(side="left")
+        ttk.Label(header, text="Window Recorder", style="Title.TLabel").pack(side="left", padx=(10, 0))
+        RoundBadge(header, "H.266  ·  VVC  ·  Opus", ACCENT_DIM, ACCENT, canvas_bg=BG).pack(side="left", padx=(12, 0))
+        self.state_badge = RoundBadge(header, "READY", OK_BG, OK, canvas_bg=BG)
         self.state_badge.pack(side="right")
         self.time_label = ttk.Label(header, text="00:00:00", style="Timer.TLabel")
         self.time_label.pack(side="right", padx=(0, 10))
@@ -380,27 +803,44 @@ class RecorderApp(tk.Tk):
         self._tab_bar.pack(side="left")
         self._tab_labels: dict[str, tk.Label] = {}
         self._tab_rules: dict[str, tk.Frame] = {}
-        for key, title in (("record", "Record"), ("recs", "Recordings"), ("settings", "Settings")):
-            cell = tk.Frame(self._tab_bar, bg=BG)
-            cell.pack(side="left", padx=(0, 22))
+        tabs = (
+            ("record", "Record", "record"),
+            ("recs", "Recordings", "folder"),
+            ("activity", "Activity", "history"),
+            ("settings", "Settings", "settings"),
+        )
+        for key, title, icon_name in tabs:
+            cell = tk.Frame(self._tab_bar, bg=BG, cursor="hand2")
+            cell.pack(side="left", padx=(0, 18))
+            row = tk.Frame(cell, bg=BG, cursor="hand2")
+            row.pack()
+            icon_lbl = tk.Label(
+                row,
+                text=ico(icon_name),
+                bg=BG,
+                fg=MUTED,
+                font=(ICON_FONT, 13),
+                cursor="hand2",
+            )
+            icon_lbl.pack(side="left", padx=(2, 6))
             lbl = tk.Label(
-                cell,
+                row,
                 text=title,
                 bg=BG,
                 fg=MUTED,
-                font=("Segoe UI Semibold", 13),
+                font=(UI_FONT_SEMI, 13),
                 cursor="hand2",
-                padx=2,
                 pady=4,
             )
-            lbl.pack()
-            rule = tk.Frame(cell, bg=BG, height=2)
-            rule.pack(fill="x")
-            lbl.bind("<Button-1>", lambda _e, k=key: self._show_page(k))
-            rule.bind("<Button-1>", lambda _e, k=key: self._show_page(k))
-            lbl.bind("<Enter>", lambda _e, k=key: self._tab_hover(k, True))
-            lbl.bind("<Leave>", lambda _e, k=key: self._tab_hover(k, False))
+            lbl.pack(side="left")
+            rule = tk.Frame(cell, bg=BG, height=3)
+            rule.pack(fill="x", pady=(4, 0))
+            for widget in (cell, row, icon_lbl, lbl, rule):
+                widget.bind("<Button-1>", lambda _e, k=key: self._show_page(k))
+                widget.bind("<Enter>", lambda _e, k=key: self._tab_hover(k, True))
+                widget.bind("<Leave>", lambda _e, k=key: self._tab_hover(k, False))
             self._tab_labels[key] = lbl
+            self._tab_icons[key] = icon_lbl
             self._tab_rules[key] = rule
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x", padx=18, pady=(0, 8))
 
@@ -408,8 +848,14 @@ class RecorderApp(tk.Tk):
         self._page_host.pack(fill="both", expand=True, padx=18, pady=(0, 6))
         self.record_tab = ttk.Frame(self._page_host)
         self.recs_tab = ttk.Frame(self._page_host)
+        self.activity_tab = ttk.Frame(self._page_host)
         self.settings_tab = ttk.Frame(self._page_host)
-        self._pages = {"record": self.record_tab, "recs": self.recs_tab, "settings": self.settings_tab}
+        self._pages = {
+            "record": self.record_tab,
+            "recs": self.recs_tab,
+            "activity": self.activity_tab,
+            "settings": self.settings_tab,
+        }
         self._current_page = "record"
 
         body = ttk.Frame(self.record_tab)
@@ -418,20 +864,20 @@ class RecorderApp(tk.Tk):
         left = ttk.LabelFrame(body, text="  Source  ")
         left.pack(side="left", fill="both", expand=True)
 
-        btns = ttk.Frame(left)
+        btns = tk.Frame(left, bg=BG)
         btns.pack(fill="x", padx=10, pady=(10, 6))
-        ttk.Button(btns, text="Refresh", style="Ghost.TButton", command=self.refresh_windows).pack(side="left")
-        ttk.Button(
-            btns, text="Choose window", style="Accent.TButton", command=self._open_share_picker
+        RoundButton(btns, text="Refresh", icon="refresh", command=self.refresh_windows, canvas_bg=BG).pack(side="left")
+        RoundButton(
+            btns, text="Choose window", icon="window", kind="accent", command=self._open_share_picker, canvas_bg=BG
         ).pack(side="left", padx=(8, 0))
-        ttk.Button(
-            btns, text="Click on screen", style="Ghost.TButton", command=self._start_click_pick
+        RoundButton(
+            btns, text="Click on screen", icon="pointer", command=self._start_click_pick, canvas_bg=BG
         ).pack(side="left", padx=(8, 0))
         self.filter_var = tk.StringVar()
         self.filter_var.trace_add("write", lambda *_: self._apply_filter())
         filt = ttk.Entry(btns, textvariable=self.filter_var, width=18)
         filt.pack(side="right")
-        ttk.Label(btns, text="Search", style="Muted.TLabel").pack(side="right", padx=(0, 6))
+        tk.Label(btns, text=ico("search"), bg=BG, fg=MUTED, font=(ICON_FONT, 12)).pack(side="right", padx=(0, 6))
 
         ttk.Label(
             left,
@@ -463,45 +909,42 @@ class RecorderApp(tk.Tk):
 
         actions = tk.Frame(self.record_tab, bg=BG)
         actions.pack(fill="x", padx=12, pady=(8, 0))
-        self.record_btn = ttk.Button(
-            actions, text="●   Record    F9", style="Record.TButton", command=self.toggle_record
+        self.record_btn = RoundButton(
+            actions,
+            text="Record    F9",
+            icon="record",
+            kind="record",
+            height=48,
+            min_width=220,
+            command=self.toggle_record,
+            canvas_bg=BG,
         )
         self.record_btn.pack(side="left", fill="x", expand=True)
-        self.pause_btn = ttk.Button(actions, text="Pause", command=self.toggle_pause, state="disabled")
-        self.pause_btn.pack(side="left", padx=(8, 0), ipadx=18)
+        self.pause_btn = RoundButton(
+            actions, text="Pause", icon="pause", height=48, min_width=120, command=self.toggle_pause, canvas_bg=BG
+        )
+        self.pause_btn.configure(state="disabled")
+        self.pause_btn.pack(side="left", padx=(8, 0))
 
+        self._build_activity_page()
         self._build_settings_page()
 
-        log_frame = ttk.LabelFrame(self.record_tab, text="  Activity  ")
-        log_frame.pack(fill="x", padx=12, pady=(8, 10))
-        self.log = tk.Text(
-            log_frame,
-            height=5,
-            bg=PANEL,
-            fg=FG,
-            relief="flat",
-            font=("Consolas", 9),
-            highlightbackground=BORDER,
-            highlightcolor=ACCENT,
-            highlightthickness=1,
-            wrap="word",
-            insertbackground=FG,
-            padx=8,
-            pady=6,
-        )
-        self.log.pack(fill="x", padx=4, pady=4)
-        self.log.configure(state="disabled")
-
-        rec_bar = ttk.Frame(self.recs_tab)
+        rec_bar = tk.Frame(self.recs_tab, bg=BG)
         rec_bar.pack(fill="x", padx=12, pady=(12, 8))
-        ttk.Button(rec_bar, text="Refresh", style="Ghost.TButton", command=lambda: self.refresh_recordings(log=True)).pack(
-            side="left"
+        RoundButton(
+            rec_bar,
+            text="Refresh",
+            icon="refresh",
+            command=lambda: self.refresh_recordings(log=True),
+            canvas_bg=BG,
+        ).pack(side="left")
+        self.play_btn = RoundButton(
+            rec_bar, text="Play", icon="play", kind="accent", command=self._play_selected, canvas_bg=BG
         )
-        self.play_btn = ttk.Button(rec_bar, text="Play", style="Accent.TButton", command=self._play_selected)
         self.play_btn.pack(side="left", padx=(8, 0))
-        ttk.Button(rec_bar, text="Open folder", style="Ghost.TButton", command=self._open_recordings_folder).pack(
-            side="left", padx=(8, 0)
-        )
+        RoundButton(
+            rec_bar, text="Open folder", icon="folderopen", command=self._open_recordings_folder, canvas_bg=BG
+        ).pack(side="left", padx=(8, 0))
         ttk.Label(rec_bar, text="Double-click or Enter to play in MPC-HC", style="Hint.TLabel").pack(
             side="left", padx=12
         )
@@ -546,6 +989,38 @@ class RecorderApp(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._show_page("record")
 
+    def _build_activity_page(self) -> None:
+        head = tk.Frame(self.activity_tab, bg=BG)
+        head.pack(fill="x", padx=12, pady=(14, 6))
+        tk.Label(head, text=ico("history"), bg=BG, fg=ACCENT, font=(ICON_FONT, 16)).pack(side="left")
+        ttk.Label(head, text="Activity", style="Title.TLabel").pack(side="left", padx=(8, 0))
+        ttk.Label(
+            self.activity_tab,
+            text="Hardware checks, capture progress, and save messages.",
+            style="Muted.TLabel",
+        ).pack(anchor="w", padx=14, pady=(0, 8))
+        log_wrap = tk.Frame(self.activity_tab, bg=BG)
+        log_wrap.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self.log = tk.Text(
+            log_wrap,
+            bg=PANEL,
+            fg=FG,
+            relief="flat",
+            font=(UI_FONT, 10),
+            highlightbackground=BORDER,
+            highlightcolor=ACCENT,
+            highlightthickness=1,
+            wrap="word",
+            insertbackground=FG,
+            padx=12,
+            pady=10,
+        )
+        scroll = ttk.Scrollbar(log_wrap, command=self.log.yview)
+        self.log.configure(yscrollcommand=scroll.set)
+        self.log.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        self.log.configure(state="disabled")
+
     def _build_settings_page(self) -> None:
         host = tk.Frame(self.settings_tab, bg=BG)
         host.pack(fill="both", expand=True, padx=12, pady=(10, 10))
@@ -576,7 +1051,7 @@ class RecorderApp(tk.Tk):
         right = tk.Frame(cols, bg=BG)
         right.pack(side="left", fill="both", expand=True, padx=(8, 0))
 
-        capture = self._card(left, "Capture")
+        capture = self._card(left, "Capture", "video")
         grid = tk.Frame(capture, bg=PANEL)
         grid.pack(fill="x")
         grid.columnconfigure(0, weight=1)
@@ -587,38 +1062,39 @@ class RecorderApp(tk.Tk):
         self.resolution_var = tk.StringVar(value=DEFAULT_VIDEO_PRESET)
         self.quality_var = tk.StringVar(value=str(DEFAULT_QUALITY))
 
-        self._add_setting_row(grid, 0, "FPS", self.fps_var, 1, 240, 1, 1, "fps", "fps")
+        self._add_setting_row(grid, 0, "FPS", self.fps_var, 1, 240, 1, 1, "fps", "fps", "clock")
 
         res_row = tk.Frame(grid, bg=PANEL2)
-        res_row.grid(row=1, column=0, sticky="ew", pady=3)
+        res_row.grid(row=1, column=0, sticky="ew", pady=4)
+        tk.Label(res_row, text=ico("video"), bg=PANEL2, fg=ACCENT, font=(ICON_FONT, 12)).pack(
+            side="left", padx=(12, 0), pady=8
+        )
         tk.Label(
             res_row,
             text="Resolution",
             bg=PANEL2,
             fg=MUTED,
-            font=("Segoe UI", 9),
-            width=12,
+            font=(UI_FONT, 9),
+            width=11,
             anchor="w",
-        ).pack(side="left", padx=(10, 4), pady=8)
-        for value in VIDEO_PRESETS:
-            ttk.Radiobutton(
-                res_row,
-                text=value,
-                value=value,
-                variable=self.resolution_var,
-                style="Side.TRadiobutton",
-            ).pack(side="left", padx=6, pady=8)
+        ).pack(side="left", padx=(8, 4), pady=8)
+        PillBar(
+            res_row,
+            self.resolution_var,
+            [(value, value, "") for value in VIDEO_PRESETS],
+            bg=PANEL2,
+        ).pack(side="left", padx=(0, 8))
 
         self._add_setting_row(
-            grid, 2, "Quality", self.quality_var, QUALITY_MIN, QUALITY_MAX, 5, MIN_USEFUL_QUALITY, "quality", ""
+            grid, 2, "Quality", self.quality_var, QUALITY_MIN, QUALITY_MAX, 5, MIN_USEFUL_QUALITY, "quality", "", "record"
         )
 
-        audio = self._card(right, "Audio")
+        audio = self._card(right, "Audio", "volume")
         agrid = tk.Frame(audio, bg=PANEL)
         agrid.pack(fill="x")
         agrid.columnconfigure(0, weight=1)
         self._add_setting_row(
-            agrid, 0, "Bit rate", self.audio_kbps_var, AUDIO_KBPS_MIN, AUDIO_KBPS_MAX, 8, MIN_USEFUL_AUDIO_KBPS, "audio", "kb/s"
+            agrid, 0, "Bit rate", self.audio_kbps_var, AUDIO_KBPS_MIN, AUDIO_KBPS_MAX, 8, MIN_USEFUL_AUDIO_KBPS, "audio", "kb/s", "volume"
         )
         self._add_setting_row(
             agrid,
@@ -631,25 +1107,25 @@ class RecorderApp(tk.Tk):
             MIN_USEFUL_SAMPLE_KHZ,
             "sample",
             "kHz",
+            "clock",
         )
 
-        ttk.Label(audio, text="Sound source", style="Side.TLabel").pack(anchor="w", padx=2, pady=(12, 6))
+        source_row = tk.Frame(audio, bg=PANEL)
+        source_row.pack(fill="x", pady=(12, 0))
+        tk.Label(source_row, text=ico("volume"), bg=PANEL, fg=ACCENT, font=(ICON_FONT, 12)).pack(side="left", padx=(2, 6))
+        ttk.Label(source_row, text="Sound source", style="Side.TLabel").pack(side="left")
         self.audio_var = tk.StringVar(value="internal")
-        audio_row = tk.Frame(audio, bg=PANEL2)
-        audio_row.pack(fill="x", pady=(0, 6))
-        for value, label in (("internal", "Internal"), ("external", "Mic"), ("both", "Both")):
-            ttk.Radiobutton(
-                audio_row,
-                text=label,
-                value=value,
-                variable=self.audio_var,
-                command=self._audio_changed,
-                style="Side.TRadiobutton",
-            ).pack(side="left", padx=8, pady=8)
+        PillBar(
+            audio,
+            self.audio_var,
+            (("internal", "Internal", "volume"), ("external", "Mic", "mic"), ("both", "Both", "people")),
+            command=self._audio_changed,
+            bg=PANEL,
+        ).pack(anchor="w", pady=(6, 6))
 
         mic_row = tk.Frame(audio, bg=PANEL2)
         mic_row.pack(fill="x", pady=3)
-        tk.Label(mic_row, text="Mic", bg=PANEL2, fg=MUTED, font=("Segoe UI", 9), width=12, anchor="w").pack(
+        tk.Label(mic_row, text="Mic", bg=PANEL2, fg=MUTED, font=(UI_FONT, 9), width=12, anchor="w").pack(
             side="left", padx=(10, 4), pady=8
         )
         self.mic_var = tk.StringVar()
@@ -658,7 +1134,7 @@ class RecorderApp(tk.Tk):
 
         lb_row = tk.Frame(audio, bg=PANEL2)
         lb_row.pack(fill="x", pady=3)
-        tk.Label(lb_row, text="Loopback", bg=PANEL2, fg=MUTED, font=("Segoe UI", 9), width=12, anchor="w").pack(
+        tk.Label(lb_row, text="Loopback", bg=PANEL2, fg=MUTED, font=(UI_FONT, 9), width=12, anchor="w").pack(
             side="left", padx=(10, 4), pady=8
         )
         self.loop_var = tk.StringVar()
@@ -670,14 +1146,14 @@ class RecorderApp(tk.Tk):
             style="Side.TLabel",
         ).pack(anchor="w", padx=2, pady=(8, 0))
 
-        out = self._card(inner, "Save to")
+        out = self._card(inner, "Save to", "folder")
         path_row = tk.Frame(out, bg=PANEL2)
         path_row.pack(fill="x")
         self.dir_var = tk.StringVar(value=str(self.output_dir))
         ttk.Entry(path_row, textvariable=self.dir_var).pack(side="left", fill="x", expand=True, padx=(10, 6), pady=8)
-        ttk.Button(path_row, text="Browse", style="Ghost.TButton", command=self._browse).pack(
-            side="left", padx=(0, 10), pady=8
-        )
+        RoundButton(
+            path_row, text="Browse", icon="folderopen", command=self._browse, canvas_bg=PANEL2, height=36
+        ).pack(side="left", padx=(0, 10), pady=8)
 
         self.audio_kbps_var.trace_add("write", lambda *_: self._refresh_quality_hints())
         self.sample_rate_var.trace_add("write", lambda *_: self._refresh_quality_hints())
@@ -686,22 +1162,23 @@ class RecorderApp(tk.Tk):
 
         self._bind_sidebar_scroll(canvas, inner)
 
+    def _paint_tab(self, key: str, active: bool, hover: bool = False) -> None:
+        fg = FG if active or hover else MUTED
+        self._tab_labels[key].configure(fg=fg, font=(UI_FONT_SEMI, 13))
+        self._tab_icons[key].configure(fg=ACCENT if active or hover else MUTED)
+        self._tab_rules[key].configure(bg=ACCENT if active else BG)
+
     def _tab_hover(self, key: str, on: bool) -> None:
         if key == self._current_page:
             return
-        self._tab_labels[key].configure(fg=FG if on else MUTED)
+        self._paint_tab(key, False, hover=on)
 
     def _show_page(self, key: str) -> None:
         if key not in self._pages:
             return
         for name, page in self._pages.items():
             page.pack_forget()
-            active = name == key
-            self._tab_labels[name].configure(
-                fg=FG if active else MUTED,
-                font=("Segoe UI Semibold", 13),
-            )
-            self._tab_rules[name].configure(bg=ACCENT if active else BG)
+            self._paint_tab(name, name == key)
         if self._current_page == "settings":
             self._commit_settings()
         self._pages[key].pack(fill="both", expand=True)
@@ -1006,10 +1483,10 @@ class RecorderApp(tk.Tk):
 
         bar = ttk.Frame(dlg)
         bar.pack(fill="x", padx=16, pady=(8, 14))
-        ttk.Button(bar, text="Click on screen...", style="Accent.TButton", command=lambda: click_screen()).pack(
-            side="left"
-        )
-        ttk.Button(bar, text="Cancel", command=lambda: close()).pack(side="right")
+        RoundButton(
+            bar, text="Click on screen", icon="pointer", kind="accent", command=lambda: click_screen(), canvas_bg=BG
+        ).pack(side="left")
+        RoundButton(bar, text="Cancel", icon="cancel", command=lambda: close(), canvas_bg=BG).pack(side="right")
 
         dlg._photos = []
         thumb_dir = Path(tempfile.mkdtemp(prefix="recorder-share-"))
@@ -1067,7 +1544,7 @@ class RecorderApp(tk.Tk):
                 text=f"{title}\n{sub}",
                 bg=PANEL,
                 fg=FG,
-                font=("Segoe UI", 9),
+                font=(UI_FONT, 9),
                 justify="center",
                 cursor="hand2",
             )
@@ -1135,7 +1612,7 @@ class RecorderApp(tk.Tk):
             text="  Click the window to record    Esc cancels  ",
             background=ACCENT,
             foreground=ON_COLOR,
-            font=("Segoe UI Semibold", 12),
+            font=(UI_FONT_SEMI, 12),
         ).pack(padx=10, pady=10)
         banner.update_idletasks()
         bw = banner.winfo_width()
@@ -1197,7 +1674,7 @@ class RecorderApp(tk.Tk):
             return
         self.session.set_paused(not self.session.paused)
         paused = self.session.paused
-        self.pause_btn.configure(text="Resume" if paused else "Pause")
+        self.pause_btn.configure(text="Resume" if paused else "Pause", icon="play" if paused else "pause")
         self._set_live_badge("paused" if paused else "rec")
 
     def refresh_audio(self) -> None:
@@ -1261,7 +1738,7 @@ class RecorderApp(tk.Tk):
     def toggle_record(self) -> None:
         if self.session:
             self._stop_timer()
-            self.record_btn.configure(state="disabled", text="■   Saving")
+            self.record_btn.configure(state="disabled", text="Saving")
             self.pause_btn.configure(state="disabled")
             threading.Thread(target=self._stop_worker, daemon=True).start()
             return
@@ -1349,7 +1826,7 @@ class RecorderApp(tk.Tk):
             self.session = None
             messagebox.showerror("Record failed", str(exc))
             return
-        self.record_btn.configure(text="■   Stop    F9", style="Stop.TButton")
+        self.record_btn.configure(text="Stop    F9", style="Stop.TButton", state="normal")
         self.pause_btn.configure(state="normal", text="Pause")
         self._set_live_badge("rec")
         try:
@@ -1395,7 +1872,7 @@ class RecorderApp(tk.Tk):
             self.after_cancel(self._tick_job)
             self._tick_job = None
         self.session = None
-        self.record_btn.configure(text="●   Record    F9", style="Record.TButton", state="normal")
+        self.record_btn.configure(text="Record    F9", style="Record.TButton", state="normal")
         self.pause_btn.configure(state="disabled", text="Pause")
         self._set_live_badge("ready")
         try:
