@@ -41,15 +41,18 @@ SAMPLE_KHZ_MAX = SAMPLE_RATE_MAX // 1000
 OPUS_SAMPLE_RATES = (8000, 12000, 16000, 24000, 48000)
 
 # Output height presets. Width follows the window so the picture stays in proportion.
-VIDEO_PRESETS = ("144p", "240p", "480p")
+VIDEO_PRESETS = ("144p", "240p", "360p", "480p")
 DEFAULT_VIDEO_PRESET = "240p"
-VIDEO_PRESET_HEIGHT = {"144p": 144, "240p": 240, "480p": 480}
-# Lower presets use a lower rate so the file actually gets smaller.
-VIDEO_PRESET_KBPS = {"144p": 150, "240p": 300, "480p": 600}
+VIDEO_PRESET_HEIGHT = {"144p": 144, "240p": 240, "360p": 360, "480p": 480}
 
-DEFAULT_VIDEO_KBPS = VIDEO_PRESET_KBPS[DEFAULT_VIDEO_PRESET]
-VIDEO_KBPS_MIN = 100
-VIDEO_KBPS_MAX = 50000
+# 100 is the sharpest (largest). 0 is the smallest file. Below the floor, UI text smears.
+QUALITY_MIN = 0
+QUALITY_MAX = 100
+DEFAULT_QUALITY = 40
+MIN_USEFUL_QUALITY = 40
+# libvvenc QP: lower is sharper. 100 -> 16, 0 -> 51.
+QP_AT_QUALITY_100 = 16
+QP_AT_QUALITY_0 = 51
 
 
 @dataclass
@@ -63,7 +66,7 @@ class RecordConfig:
     audio_kbps: int = DEFAULT_AUDIO_KBPS
     sample_rate: int = DEFAULT_SAMPLE_RATE
     video_preset: str = DEFAULT_VIDEO_PRESET
-    video_kbps: int = DEFAULT_VIDEO_KBPS
+    video_quality: int = DEFAULT_QUALITY
 
 
 def clamp_audio_kbps(n: int) -> int:
@@ -83,19 +86,27 @@ def snap_opus_rate(n: int) -> int:
     return min(OPUS_SAMPLE_RATES, key=lambda rate: abs(rate - n))
 
 
-def clamp_video_kbps(n: int) -> int:
-    return max(VIDEO_KBPS_MIN, min(VIDEO_KBPS_MAX, int(n)))
+def clamp_quality(n: int) -> int:
+    return max(QUALITY_MIN, min(QUALITY_MAX, int(n)))
 
 
-def resolve_video_preset(name: str) -> tuple[str, int, int]:
-    """Return (label, height, kbps) for a 144p / 240p / 480p choice."""
+def quality_to_qp(quality: int) -> int:
+    """Map 0–100 quality onto a libvvenc QP. Higher quality uses a lower QP."""
+    q = clamp_quality(quality)
+    span = QP_AT_QUALITY_0 - QP_AT_QUALITY_100
+    qp = QP_AT_QUALITY_100 + span * (QUALITY_MAX - q) / QUALITY_MAX
+    return int(round(qp))
+
+
+def resolve_video_preset(name: str) -> tuple[str, int]:
+    """Return (label, height) for a 144p / 240p / 360p / 480p choice."""
     key = name if name in VIDEO_PRESET_HEIGHT else DEFAULT_VIDEO_PRESET
-    return key, VIDEO_PRESET_HEIGHT[key], VIDEO_PRESET_KBPS[key]
+    return key, VIDEO_PRESET_HEIGHT[key]
 
 
 def scaled_frame_size(src_w: int, src_h: int, preset: str) -> tuple[int, int]:
     """Even width x target height, keeping the source aspect ratio."""
-    _key, target_h, _kbps = resolve_video_preset(preset)
+    _key, target_h = resolve_video_preset(preset)
     src_w = max(2, int(src_w) - (int(src_w) % 2))
     src_h = max(2, int(src_h) - (int(src_h) % 2))
     exact = src_w * target_h / src_h
@@ -206,11 +217,10 @@ def default_output_path(root: Path, window: WindowInfo) -> Path:
     return root / f"{name}_{stamp}.mp4"
 
 
-def _vvenc_tail(hw: HardwareProfile, fps: int, video_kbps: int, video_path: Path) -> list[str]:
-    kbps = clamp_video_kbps(video_kbps)
-    # libvvenc defaults to -qp 32. Older FFmpeg wrappers then pass bitrate=0
-    # (fixed QP) unless qp is -1. Without this, Data rate / Total never change the file.
-    maxrate = kbps * 2
+def _vvenc_tail(hw: HardwareProfile, fps: int, video_quality: int, video_path: Path) -> list[str]:
+    # Fixed bitrate kept spending the full rate on a still screen, so files
+    # stayed large. Quality picks a QP instead: a quiet window uses few bits.
+    qp = quality_to_qp(video_quality)
     return [
         "-vf",
         "scale=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p10le",
@@ -221,17 +231,11 @@ def _vvenc_tail(hw: HardwareProfile, fps: int, video_kbps: int, video_path: Path
         "-preset",
         hw.recommended_vvenc_preset(fps),
         "-qp",
-        "-1",
-        "-b:v",
-        f"{kbps}k",
-        "-maxrate",
-        f"{maxrate}k",
-        "-bufsize",
-        f"{kbps * 2}k",
+        str(qp),
         "-qpa",
         "1",
         "-period",
-        "1",
+        "4",
         "-pix_fmt",
         "yuv420p10le",
         "-tag:v",
@@ -252,7 +256,7 @@ def build_hwnd_cmd(
     width: int,
     height: int,
     fps: int,
-    video_kbps: int,
+    video_quality: int,
     video_path: Path,
 ) -> list[str]:
     ffmpeg = _ffmpeg(hw)
@@ -273,7 +277,7 @@ def build_hwnd_cmd(
         str(fps),
         "-i",
         "-",
-        *_vvenc_tail(hw, fps, video_kbps, video_path),
+        *_vvenc_tail(hw, fps, video_quality, video_path),
     ]
 
 
@@ -316,7 +320,7 @@ def build_video_cmd(
             "desktop",
         ]
 
-    cmd += _vvenc_tail(hw, fps, cfg.video_kbps, video_path)
+    cmd += _vvenc_tail(hw, fps, cfg.video_quality, video_path)
     return cmd
 
 
@@ -453,9 +457,9 @@ class CaptureSession:
         fps = max(1, min(240, int(self.cfg.fps)))
         flags = CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
-        preset, _height, preset_kbps = resolve_video_preset(self.cfg.video_preset)
+        preset, _height = resolve_video_preset(self.cfg.video_preset)
         self.cfg.video_preset = preset
-        self.cfg.video_kbps = preset_kbps
+        self.cfg.video_quality = clamp_quality(self.cfg.video_quality)
 
         if self._hwnd_mode:
             if not self.cfg.window.hwnd:
@@ -481,7 +485,7 @@ class CaptureSession:
             self._frame_w,
             self._frame_h,
             fps,
-            self.cfg.video_kbps,
+            self.cfg.video_quality,
             self.video_tmp,
         )
         self.on_log("FFmpeg: " + " ".join(cmd))
@@ -494,12 +498,11 @@ class CaptureSession:
             sample_rate=snap_opus_rate(self.cfg.sample_rate),
         )
         self.audio.start()
-        total = clamp_video_kbps(self.cfg.video_kbps) + clamp_audio_kbps(self.cfg.audio_kbps)
         self.on_log(
             f"Audio: {self.cfg.audio_mode} (WASAPI) -> Opus {self.cfg.audio_kbps} kb/s "
             f"{snap_opus_rate(self.cfg.sample_rate)} Hz | "
             f"video {self.cfg.video_preset} {self._frame_w}x{self._frame_h} "
-            f"({self.cfg.video_kbps} kb/s) | total {total} kb/s"
+            f"quality {self.cfg.video_quality} (QP {quality_to_qp(self.cfg.video_quality)})"
         )
 
         self.proc = subprocess.Popen(
@@ -713,10 +716,10 @@ class CaptureSession:
             self.cfg.sample_rate,
             comment=(
                 f"{self.cfg.fps} fps, {self.cfg.video_preset} "
-                f"({self._frame_w}x{self._frame_h}, {self.cfg.video_kbps} kb/s), "
+                f"({self._frame_w}x{self._frame_h}), quality {self.cfg.video_quality} "
+                f"(QP {quality_to_qp(self.cfg.video_quality)}), "
                 f"audio {self.cfg.audio_kbps} kb/s, "
-                f"{snap_opus_rate(self.cfg.sample_rate) // 1000} kHz Opus, "
-                f"total {clamp_video_kbps(self.cfg.video_kbps) + clamp_audio_kbps(self.cfg.audio_kbps)} kb/s"
+                f"{snap_opus_rate(self.cfg.sample_rate) // 1000} kHz Opus"
             ),
         )
         self.on_log("Mux: " + " ".join(mux))

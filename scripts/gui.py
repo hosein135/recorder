@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tkinter GUI: pick a window, FPS, 144p/240p/480p, audio, record H.266/VVC."""
+"""Tkinter GUI: pick a window, FPS, resolution, quality, audio, record H.266/VVC."""
 
 from __future__ import annotations
 
@@ -39,10 +39,14 @@ from capture import (
     CaptureSession,
     DEFAULT_AUDIO_KBPS,
     DEFAULT_FPS,
+    DEFAULT_QUALITY,
     DEFAULT_SAMPLE_KHZ,
     DEFAULT_VIDEO_PRESET,
     MIN_USEFUL_AUDIO_KBPS,
+    MIN_USEFUL_QUALITY,
     MIN_USEFUL_SAMPLE_KHZ,
+    QUALITY_MAX,
+    QUALITY_MIN,
     RecordConfig,
     RecorderError,
     SAMPLE_KHZ_MAX,
@@ -483,6 +487,7 @@ class RecorderApp(tk.Tk):
         self.audio_kbps_var = tk.StringVar(value=str(DEFAULT_AUDIO_KBPS))
         self.sample_rate_var = tk.StringVar(value=str(DEFAULT_SAMPLE_KHZ))
         self.resolution_var = tk.StringVar(value=DEFAULT_VIDEO_PRESET)
+        self.quality_var = tk.StringVar(value=str(DEFAULT_QUALITY))
 
         self._add_setting_row(grid, 0, "FPS", self.fps_var, 1, 240, 1, 1, "fps", "fps")
 
@@ -504,7 +509,11 @@ class RecorderApp(tk.Tk):
                 value=value,
                 variable=self.resolution_var,
                 style="Side.TRadiobutton",
-            ).pack(side="left", padx=8, pady=8)
+            ).pack(side="left", padx=6, pady=8)
+
+        self._add_setting_row(
+            grid, 2, "Quality", self.quality_var, QUALITY_MIN, QUALITY_MAX, 5, MIN_USEFUL_QUALITY, "quality", ""
+        )
 
         audio = self._card(right, "Audio")
         agrid = tk.Frame(audio, bg=PANEL)
@@ -575,6 +584,7 @@ class RecorderApp(tk.Tk):
         self.audio_kbps_var.trace_add("write", lambda *_: self._refresh_quality_hints())
         self.sample_rate_var.trace_add("write", lambda *_: self._refresh_quality_hints())
         self.fps_var.trace_add("write", lambda *_: self._refresh_quality_hints())
+        self.quality_var.trace_add("write", lambda *_: self._refresh_quality_hints())
 
         self._bind_sidebar_scroll(canvas, inner)
 
@@ -765,6 +775,7 @@ class RecorderApp(tk.Tk):
     def _refresh_quality_hints(self) -> None:
         checks: list[tuple[str, tk.StringVar, int]] = [
             ("fps", self.fps_var, 1),
+            ("quality", self.quality_var, DEFAULT_QUALITY),
             ("audio", self.audio_kbps_var, DEFAULT_AUDIO_KBPS),
             ("sample", self.sample_rate_var, DEFAULT_SAMPLE_KHZ),
         ]
@@ -1182,7 +1193,19 @@ class RecorderApp(tk.Tk):
         if parsed is None:
             return
         audio_kbps, sample_rate = parsed
-        preset, _height, video_kbps = resolve_video_preset(self.resolution_var.get().strip())
+        quality = self._read_int_setting(
+            self.quality_var, "Quality", QUALITY_MIN, QUALITY_MAX, str(DEFAULT_QUALITY)
+        )
+        if quality is None:
+            return
+        if quality < MIN_USEFUL_QUALITY:
+            if not messagebox.askyesno(
+                "Quality may be too low",
+                f"Quality {quality} is below {MIN_USEFUL_QUALITY}. "
+                "On-screen text and UI often become hard to read. Record anyway?",
+            ):
+                return
+        preset, _height = resolve_video_preset(self.resolution_var.get().strip())
 
         mode = self.audio_var.get()
         mic = self._device_by_label(self.mics, self.mic_var.get()) if mode in ("external", "both") else None
@@ -1208,7 +1231,7 @@ class RecorderApp(tk.Tk):
             audio_kbps=clamp_audio_kbps(audio_kbps),
             sample_rate=clamp_sample_rate(sample_rate),
             video_preset=preset,
-            video_kbps=video_kbps,
+            video_quality=quality,
         )
         self.session = CaptureSession(cfg, self.hw, on_log=self._log)
         try:
@@ -1226,7 +1249,7 @@ class RecorderApp(tk.Tk):
             pass
         self._tick()
         self._log(
-            f"Recording {window.label()} @ {fps} fps, {preset}, "
+            f"Recording {window.label()} @ {fps} fps, {preset}, quality {quality}, "
             f"Opus {audio_kbps} kb/s {snap_opus_rate(sample_rate) // 1000} kHz -> {cfg.output.name}"
         )
 
