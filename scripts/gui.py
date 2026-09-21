@@ -231,15 +231,52 @@ def _widget_bg(widget: tk.Misc) -> str:
     return BG
 
 
-def _round_shape(canvas: tk.Canvas, x1: int, y1: int, x2: int, y2: int, radius: int, fill: str) -> None:
-    r = max(1, min(radius, (x2 - x1) // 2, (y2 - y1) // 2))
-    kw = {"fill": fill, "outline": fill}
-    canvas.create_arc(x1, y1, x1 + 2 * r, y1 + 2 * r, start=90, extent=90, style="pieslice", **kw)
-    canvas.create_arc(x2 - 2 * r, y1, x2, y1 + 2 * r, start=0, extent=90, style="pieslice", **kw)
-    canvas.create_arc(x1, y2 - 2 * r, x1 + 2 * r, y2, start=180, extent=90, style="pieslice", **kw)
-    canvas.create_arc(x2 - 2 * r, y2 - 2 * r, x2, y2, start=270, extent=90, style="pieslice", **kw)
-    canvas.create_rectangle(x1 + r, y1, x2 - r, y2, **kw)
-    canvas.create_rectangle(x1, y1 + r, x2, y2 - r, **kw)
+def _blend(fg: str, bg: str, amount: float) -> str:
+    fr, fg_, fb = _hex_rgb(fg)
+    br, bg_, bb = _hex_rgb(bg)
+    return "#{:02x}{:02x}{:02x}".format(
+        int(br + (fr - br) * amount),
+        int(bg_ + (fg_ - bg_) * amount),
+        int(bb + (fb - bb) * amount),
+    )
+
+
+def _round_points(x1: float, y1: float, x2: float, y2: float, radius: float) -> list[float]:
+    """One outline, sampled from circular corners, so the fill has no seams."""
+    r = max(1.0, min(radius, (x2 - x1) / 2, (y2 - y1) / 2))
+    steps = 10
+    arcs = (
+        (x2 - r, y1 + r, 90, 0),
+        (x2 - r, y2 - r, 0, -90),
+        (x1 + r, y2 - r, 270, 180),
+        (x1 + r, y1 + r, 180, 90),
+    )
+    points: list[float] = []
+    for cx, cy, start, end in arcs:
+        for i in range(steps + 1):
+            angle = math.radians(start + (end - start) * i / steps)
+            points.append(cx + r * math.cos(angle))
+            points.append(cy - r * math.sin(angle))
+    return points
+
+
+def _round_shape(canvas: tk.Canvas, x1: float, y1: float, x2: float, y2: float, radius: float, fill: str) -> None:
+    canvas.create_polygon(*_round_points(x1, y1, x2, y2, radius), fill=fill, outline="", smooth=False)
+
+
+def _round_shadow(
+    canvas: tk.Canvas,
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    radius: float,
+    page: str,
+    tint: str = "#152033",
+    strength: float = 0.1,
+) -> None:
+    for drop, scale in ((4, 0.45), (2, 0.75), (1, 1.0)):
+        _round_shape(canvas, x1, y1 + drop, x2, y2 + drop, radius, _blend(tint, page, strength * scale))
 
 
 class RoundButton(tk.Canvas):
@@ -385,13 +422,15 @@ class RoundButton(tk.Canvas):
         height = self.winfo_height()
         if height < 2:
             height = self._height
-        fill, fg, border = self._colors()
-        radius = height // 2
-        _round_shape(self, 1, 1, width - 1, height - 1, radius, border)
-        inset = 2 if border != fill else 1
-        _round_shape(self, inset, inset, width - inset, height - inset, max(1, radius - 1), fill)
+        fill, fg, _border = self._colors()
+        left, top, right, bottom = 2, 1, width - 3, height - 5
+        radius = max(8, (bottom - top) / 2)
+        if self._state != "disabled":
+            tint = ACCENT if (self._hover and self._kind == "ghost") else "#152033"
+            _round_shadow(self, left, top, right, bottom, radius, self._page, tint=tint, strength=0.14 if self._hover else 0.1)
+        _round_shape(self, left, top, right, bottom, radius, fill)
         glyph = ico(self._icon) if self._icon else ""
-        cy = height / 2
+        cy = (top + bottom) / 2
         if glyph and self._text:
             gap = 10
             icon_w = self._icon_font.measure(glyph) + 6
@@ -616,6 +655,7 @@ class NumberStepper(tk.Frame):
         bg: str = PANEL2,
     ) -> None:
         super().__init__(master, bg=bg)
+        self._page = bg
         self.var = variable
         self.lo = lo
         self.hi = hi
@@ -656,9 +696,10 @@ class NumberStepper(tk.Frame):
         width = max(84, self._canvas.winfo_width())
         height = max(34, self._canvas.winfo_height())
         self._canvas.delete("all")
-        _round_shape(self._canvas, 1, 1, width - 1, height - 1, height // 2, BORDER)
-        _round_shape(self._canvas, 2, 2, width - 2, height - 2, max(1, height // 2 - 1), PANEL)
-        self._entry.place(x=8, y=4, width=max(20, width - 16), height=max(16, height - 8))
+        radius = max(8, (height - 6) / 2)
+        _round_shadow(self._canvas, 2, 1, width - 3, height - 5, radius, self._page, strength=0.08)
+        _round_shape(self._canvas, 2, 1, width - 3, height - 5, radius, PANEL)
+        self._entry.place(x=10, y=5, width=max(20, width - 20), height=max(16, height - 12))
 
     def _clamp(self) -> None:
         try:
@@ -1715,10 +1756,20 @@ class RecorderApp(tk.Tk):
             title_font = tkfont.Font(card, family=UI_FONT_SEMI, size=9)
             sub_font = tkfont.Font(card, family=UI_FONT, size=8)
 
-            def paint(border: str) -> None:
+            def paint(hover: bool) -> None:
                 card.delete("all")
-                _round_shape(card, 1, 1, tile_w - 1, tile_h - 1, radius, border)
-                _round_shape(card, 2, 2, tile_w - 2, tile_h - 2, radius - 1, PANEL)
+                _round_shadow(
+                    card,
+                    3,
+                    2,
+                    tile_w - 4,
+                    tile_h - 7,
+                    radius,
+                    BG,
+                    tint=ACCENT if hover else "#152033",
+                    strength=0.16 if hover else 0.09,
+                )
+                _round_shape(card, 3, 2, tile_w - 4, tile_h - 7, radius, PANEL)
                 card.create_image(pad, pad, image=photo, anchor="nw")
                 image_r = 14
                 ix, iy = pad, pad
@@ -1732,10 +1783,10 @@ class RecorderApp(tk.Tk):
                 card.create_text(tile_w / 2, text_y + 18, text=sub, font=sub_font, fill=MUTED, anchor="n")
                 card.image = photo
 
-            paint(BORDER)
+            paint(False)
             card.bind("<Button-1>", lambda _e, target=info: choose(target))
-            card.bind("<Enter>", lambda _e: paint(ACCENT))
-            card.bind("<Leave>", lambda _e: paint(BORDER))
+            card.bind("<Enter>", lambda _e: paint(True))
+            card.bind("<Leave>", lambda _e: paint(False))
 
         def fill(rows: list[tuple[WindowInfo, Path]]) -> None:
             if closed["done"] or not dlg.winfo_exists():
