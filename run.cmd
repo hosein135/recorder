@@ -34,10 +34,26 @@ if not exist "%PS_EXE%" (
 
 net session >nul 2>&1
 if %errorlevel% neq 0 (
+    if /I "%~1"=="elevated" (
+        echo [run.cmd] This window is still not running as administrator.
+        echo Right-click run.cmd and choose Run as administrator.
+        pause
+        exit /b 1
+    )
     echo Requesting administrator privileges...
-    "%PS_EXE%" -NoProfile -Command "Start-Process -FilePath '%~f0' -ArgumentList '%*' -Verb RunAs"
-    exit /b
+    echo Approve the User Account Control prompt if Windows shows one.
+    REM No extra arguments: an empty -ArgumentList makes Start-Process fail and this window closes.
+    "%PS_EXE%" -NoProfile -Command "Start-Process -FilePath $env:ComSpec -ArgumentList '/k','\"\"%~f0\"\" elevated %*' -Verb RunAs"
+    if errorlevel 1 (
+        echo.
+        echo [run.cmd] Could not open an administrator window.
+        pause
+        exit /b 1
+    )
+    exit /b 0
 )
+
+if /I "%~1"=="elevated" shift
 
 "%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -File "%PS1%" %*
 
