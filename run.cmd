@@ -15,14 +15,31 @@ if not exist "%PS1%" (
     exit /b 1
 )
 
+REM powershell is often missing from PATH. Use the Windows PowerShell 5.1 install path.
+set "PS_EXE=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+if not exist "%PS_EXE%" set "PS_EXE=%SystemRoot%\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
+if not exist "%PS_EXE%" set "PS_EXE=%SystemRoot%\SysWOW64\WindowsPowerShell\v1.0\powershell.exe"
+if not exist "%PS_EXE%" (
+    for /f "delims=" %%P in ('where powershell 2^>nul') do (
+        if not exist "%PS_EXE%" set "PS_EXE=%%P"
+    )
+)
+if not exist "%PS_EXE%" (
+    echo [run.cmd] ERROR: powershell.exe was not found.
+    echo Expected:
+    echo   %SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe
+    pause
+    exit /b 1
+)
+
 net session >nul 2>&1
 if %errorlevel% neq 0 (
     echo Requesting administrator privileges...
-    powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -ArgumentList '%*' -Verb RunAs"
+    "%PS_EXE%" -NoProfile -Command "Start-Process -FilePath '%~f0' -ArgumentList '%*' -Verb RunAs"
     exit /b
 )
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%PS1%" %*
+"%PS_EXE%" -NoProfile -ExecutionPolicy Bypass -File "%PS1%" %*
 
 echo.
 echo ============================================================

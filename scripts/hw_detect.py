@@ -164,11 +164,30 @@ def _probe_encoder(ffmpeg: str, codec: str, extra: list[str], pix_fmt: str | Non
         return out.is_file() and out.stat().st_size > 0
 
 
+def _powershell() -> str | None:
+    """Windows PowerShell 5.1, even when it is not on PATH."""
+    if sys.platform != "win32":
+        return None
+    windir = os.environ.get("SystemRoot") or os.environ.get("WINDIR") or r"C:\Windows"
+    for rel in (
+        r"System32\WindowsPowerShell\v1.0\powershell.exe",
+        r"Sysnative\WindowsPowerShell\v1.0\powershell.exe",
+        r"SysWOW64\WindowsPowerShell\v1.0\powershell.exe",
+    ):
+        candidate = os.path.join(windir, rel)
+        if os.path.isfile(candidate):
+            return candidate
+    return shutil.which("powershell") or shutil.which("pwsh")
+
+
 def _cpu_name() -> str:
     if sys.platform == "win32":
+        powershell = _powershell()
+        if not powershell:
+            return platform.processor() or platform.machine() or "Unknown CPU"
         proc = _run(
             [
-                "powershell",
+                powershell,
                 "-NoProfile",
                 "-Command",
                 "(Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name)",
@@ -182,9 +201,12 @@ def _cpu_name() -> str:
 def _windows_video_controllers() -> list[str]:
     if sys.platform != "win32":
         return []
+    powershell = _powershell()
+    if not powershell:
+        return []
     proc = _run(
         [
-            "powershell",
+            powershell,
             "-NoProfile",
             "-Command",
             "Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name }",
